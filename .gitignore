@@ -1,0 +1,38 @@
+# .NET / Visual Studio build output
+bin/
+obj/
+publish/
+
+# User-specific
+*.user
+*.suo
+*.userprefs
+
+# Visual Studio
+.vs/
+
+# VS Code / JetBrains Rider
+.vscode/
+.idea/
+
+# Test runner output
+TestResults/
+
+# NuGet
+*.nupkg
+*.snupkg
+
+# Logs
+*.log
+
+# Local SQLite dev databases
+*.db
+*.db-shm
+*.db-wal
+
+# OMC / Ralph workflow state (not source)
+.omc/
+
+# OS metadata
+Thumbs.db
+.DS_Store
