@@ -35,8 +35,9 @@ jobs:
       - name: Rename artifact
         shell: pwsh
         run: |
-          $dest = "publish/PcUsageTracker-${{ github.ref_name }}-win-x64.exe"
-          Rename-Item publish/PcUsageTracker.App.exe $dest
+          $src = "publish/PcUsageTracker.App.exe"
+          $dst = "publish/PcUsageTracker-${{ github.ref_name }}-win-x64.exe"
+          Move-Item -LiteralPath $src -Destination $dst
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
