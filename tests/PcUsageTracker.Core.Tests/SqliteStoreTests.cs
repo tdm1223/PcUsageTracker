@@ -1,0 +1,167 @@
+using FluentAssertions;
+using Microsoft.Data.Sqlite;
+using PcUsageTracker.Core.Storage;
+
+namespace PcUsageTracker.Core.Tests;
+
+public class SqliteStoreTests : IDisposable
+{
+    readonly string _tmp;
+
+    public SqliteStoreTests()
+    {
+        _tmp = Path.Combine(Path.GetTempPath(), $"pcut-test-{Guid.NewGuid():N}.db");
+    }
+
+    public void Dispose()
+    {
+        SqliteConnection.ClearAllPools();
+        foreach (var suffix in new[] { "", "-shm", "-wal" })
+            try { File.Delete(_tmp + suffix); } catch { }
+    }
+
+    static DateTimeOffset T(int seconds) => DateTimeOffset.FromUnixTimeSeconds(1_800_000_000 + seconds);
+
+    [Fact]
+    public void migration_sets_version_to_current()
+    {
+        using var store = new SqliteStore(_tmp);
+        Migrations.ReadVersion(store.Connection).Should().Be(SqliteStore.CurrentSchemaVersion);
+    }
+
+    [Fact]
+    public void upsert_process_path_roundtrip()
+    {
+        using var store = new SqliteStore(_tmp);
+        store.UpsertProcessPath("chrome", @"C:\Apps\chrome.exe", T(0));
+        store.GetProcessPath("chrome").Should().Be(@"C:\Apps\chrome.exe");
+
+        // 두 번째 upsert는 경로 갱신
+        store.UpsertProcessPath("chrome", @"D:\NewPath\chrome.exe", T(10));
+        store.GetProcessPath("chrome").Should().Be(@"D:\NewPath\chrome.exe");
+
+        store.GetProcessPath("unknown").Should().BeNull();
+    }
+
+    [Fact]
+    public void wal_mode_enabled()
+    {
+        using var store = new SqliteStore(_tmp);
+        using var cmd = store.Connection.CreateCommand();
+        cmd.CommandText = "PRAGMA journal_mode;";
+        var mode = (string)cmd.ExecuteScalar()!;
+        mode.Should().Be("wal");
+    }
+
+    [Fact]
+    public void open_close_roundtrip_persists_duration()
+    {
+        using var store = new SqliteStore(_tmp);
+        var id = store.Open("chrome", T(0));
+        store.Close(id, T(60));
+
+        using var cmd = store.Connection.CreateCommand();
+        cmd.CommandText = "SELECT process_name, start_at, end_at, duration_sec FROM sessions WHERE id=$id;";
+        cmd.Parameters.AddWithValue("$id", id);
+        using var r = cmd.ExecuteReader();
+        r.Read().Should().BeTrue();
+        r.GetString(0).Should().Be("chrome");
+        r.GetInt64(1).Should().Be(T(0).ToUnixTimeSeconds());
+        r.GetInt64(2).Should().Be(T(60).ToUnixTimeSeconds());
+        r.GetInt32(3).Should().Be(60);
+    }
+
+    [Fact]
+    public void close_is_idempotent_on_already_closed()
+    {
+        using var store = new SqliteStore(_tmp);
+        var id = store.Open("chrome", T(0));
+        store.Close(id, T(30));
+        store.Close(id, T(99)); // 이미 end_at 설정됨 — WHERE 절에 걸리지 않음
+
+        using var cmd = store.Connection.CreateCommand();
+        cmd.CommandText = "SELECT end_at, duration_sec FROM sessions WHERE id=$id;";
+        cmd.Parameters.AddWithValue("$id", id);
+        using var r = cmd.ExecuteReader();
+        r.Read().Should().BeTrue();
+        r.GetInt64(0).Should().Be(T(30).ToUnixTimeSeconds());
+        r.GetInt32(1).Should().Be(30);
+    }
+
+    [Fact]
+    public void recover_orphaned_closes_within_cap()
+    {
+        long id1, id2;
+        using (var store = new SqliteStore(_tmp))
+        {
+            id1 = store.Open("chrome", T(0));
+            id2 = store.Open("code", T(30));
+            // Dispose 없이 종료 시뮬레이션: end_at NULL
+        }
+
+        using var reopened = new SqliteStore(_tmp);
+        var recovered = reopened.RecoverOrphanedSessions(T(100));
+        recovered.Should().Be(2);
+
+        using var cmd = reopened.Connection.CreateCommand();
+        cmd.CommandText = "SELECT id, end_at, duration_sec FROM sessions ORDER BY id;";
+        using var r = cmd.ExecuteReader();
+        r.Read(); r.GetInt64(0).Should().Be(id1);
+        r.GetInt64(1).Should().Be(T(100).ToUnixTimeSeconds());
+        r.GetInt32(2).Should().Be(100);
+        r.Read(); r.GetInt64(0).Should().Be(id2);
+        r.GetInt64(1).Should().Be(T(100).ToUnixTimeSeconds());
+        r.GetInt32(2).Should().Be(70);
+    }
+
+    [Fact]
+    public void recover_orphaned_applies_24h_cap()
+    {
+        long id;
+        using (var store = new SqliteStore(_tmp))
+        {
+            id = store.Open("chrome", T(0));
+        }
+
+        using var reopened = new SqliteStore(_tmp);
+        // now = start+3일 → cap 86400초로 제한
+        reopened.RecoverOrphanedSessions(T(3 * 86400));
+
+        using var cmd = reopened.Connection.CreateCommand();
+        cmd.CommandText = "SELECT end_at, duration_sec FROM sessions WHERE id=$id;";
+        cmd.Parameters.AddWithValue("$id", id);
+        using var r = cmd.ExecuteReader();
+        r.Read().Should().BeTrue();
+        r.GetInt64(0).Should().Be(T(86400).ToUnixTimeSeconds());
+        r.GetInt32(1).Should().Be(86400);
+    }
+
+    [Fact]
+    public void recover_orphaned_ignores_already_closed()
+    {
+        using var store = new SqliteStore(_tmp);
+        var id = store.Open("chrome", T(0));
+        store.Close(id, T(10));
+
+        var recovered = store.RecoverOrphanedSessions(T(999));
+        recovered.Should().Be(0);
+
+        using var cmd = store.Connection.CreateCommand();
+        cmd.CommandText = "SELECT duration_sec FROM sessions WHERE id=$id;";
+        cmd.Parameters.AddWithValue("$id", id);
+        Convert.ToInt32(cmd.ExecuteScalar()).Should().Be(10);
+    }
+
+    [Fact]
+    public void migration_is_idempotent_on_reopen()
+    {
+        using (var s = new SqliteStore(_tmp)) { s.Open("chrome", T(0)); }
+        using (var s = new SqliteStore(_tmp))
+        {
+            Migrations.ReadVersion(s.Connection).Should().Be(SqliteStore.CurrentSchemaVersion);
+            using var cmd = s.Connection.CreateCommand();
+            cmd.CommandText = "SELECT COUNT(*) FROM sessions;";
+            Convert.ToInt32(cmd.ExecuteScalar()).Should().Be(1);
+        }
+    }
+}
