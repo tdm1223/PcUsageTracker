@@ -89,6 +89,24 @@ dotnet run --project tools/DbInspector
 
 Or pass a custom path: `dotnet run --project tools/DbInspector -- C:\path\to\history.db`.
 
+## Release
+
+Tagged releases are published to GitHub Releases automatically via `.github/workflows/release.yml`.
+
+```
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+On tag push, the workflow (Windows runner) runs:
+
+1. `dotnet test tests/PcUsageTracker.Core.Tests -c Release`
+2. `dotnet publish src/PcUsageTracker.App -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true`
+3. Renames the output to `PcUsageTracker-<tag>-win-x64.exe`
+4. Creates a GitHub Release for the tag with the exe attached and auto-generated release notes
+
+Requires the repo to be hosted on GitHub with Actions enabled. No secrets needed — `GITHUB_TOKEN` is sufficient for Release creation via the workflow's `contents: write` permission.
+
 ## Runtime budget (measured)
 
 Measured on the release single-file build (Windows 11, .NET 8.0.205):

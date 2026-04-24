@@ -1,0 +1,46 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Test
+        run: dotnet test tests/PcUsageTracker.Core.Tests -c Release
+
+      - name: Publish single-file
+        run: >
+          dotnet publish src/PcUsageTracker.App
+          -c Release
+          -r win-x64
+          --self-contained true
+          -p:PublishSingleFile=true
+          -p:IncludeNativeLibrariesForSelfExtract=true
+          -p:DebugType=embedded
+          -o publish
+
+      - name: Rename artifact
+        shell: pwsh
+        run: |
+          $dest = "publish/PcUsageTracker-${{ github.ref_name }}-win-x64.exe"
+          Rename-Item publish/PcUsageTracker.App.exe $dest
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: publish/PcUsageTracker-${{ github.ref_name }}-win-x64.exe
+          generate_release_notes: true
+          fail_on_unmatched_files: true
