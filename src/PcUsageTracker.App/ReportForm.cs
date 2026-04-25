@@ -1,5 +1,6 @@
 using PcUsageTracker.Core.Reporting;
 using PcUsageTracker.Core.Sampling;
+using PcUsageTracker.Core.Storage;
 using Serilog;
 
 namespace PcUsageTracker.App;
@@ -13,16 +14,20 @@ internal sealed class ReportForm : Form
 
     readonly Aggregator _agg;
     readonly IClock _clock;
+    readonly SqliteStore _store;
+    readonly Action _onExclusionChanged;
     readonly DataGridView _todayGrid;
     readonly DataGridView _weekGrid;
     readonly DataGridView _allGrid;
     readonly System.Windows.Forms.Timer _refresh;
     readonly IconCache _iconCache = new();
 
-    public ReportForm(Aggregator agg, IClock clock)
+    public ReportForm(Aggregator agg, IClock clock, SqliteStore store, Action onExclusionChanged)
     {
         _agg = agg;
         _clock = clock;
+        _store = store;
+        _onExclusionChanged = onExclusionChanged;
 
         Text = "PcUsageTracker — Report";
         Size = new Size(880, 520);
@@ -41,14 +46,14 @@ internal sealed class ReportForm : Form
         split.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50));
         split.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50));
 
-        _todayGrid = BuildGrid();
-        _weekGrid = BuildGrid();
+        _todayGrid = BuildGrid(this);
+        _weekGrid = BuildGrid(this);
         split.Controls.Add(WrapWithHeader("Today (top 5)", _todayGrid), 0, 0);
         split.Controls.Add(WrapWithHeader("This week (top 5)", _weekGrid), 1, 0);
         tab1.Controls.Add(split);
 
         var tab2 = new TabPage("All-time top 20");
-        _allGrid = BuildGrid();
+        _allGrid = BuildGrid(this);
         tab2.Controls.Add(WrapWithHeader("All-time top 20", _allGrid));
 
         tabs.TabPages.Add(tab1);
@@ -70,7 +75,7 @@ internal sealed class ReportForm : Form
         };
     }
 
-    static DataGridView BuildGrid()
+    static DataGridView BuildGrid(ReportForm owner)
     {
         var g = new DataGridView
         {
@@ -116,6 +121,25 @@ internal sealed class ReportForm : Form
             FillWeight = 35,
         });
         g.CellPainting += OnCellPainting;
+
+        // 우클릭 → 행 선택 + 컨텍스트 메뉴
+        var menu = new ContextMenuStrip();
+        var deleteItem = new ToolStripMenuItem("Delete history && stop tracking");
+        deleteItem.Click += (_, _) =>
+        {
+            if (g.SelectedRows.Count == 0) return;
+            var name = g.SelectedRows[0].Cells["Process"].Value as string;
+            if (string.IsNullOrEmpty(name)) return;
+            owner.OnDeleteAndExclude(name);
+        };
+        menu.Items.Add(deleteItem);
+        g.ContextMenuStrip = menu;
+        g.CellMouseDown += (_, e) =>
+        {
+            if (e.Button != MouseButtons.Right || e.RowIndex < 0) return;
+            g.ClearSelection();
+            g.Rows[e.RowIndex].Selected = true;
+        };
         return g;
     }
 
@@ -195,6 +219,30 @@ internal sealed class ReportForm : Form
         return ts.TotalHours >= 1
             ? $"{(int)ts.TotalHours}:{ts.Minutes:D2}:{ts.Seconds:D2}"
             : $"{ts.Minutes:D2}:{ts.Seconds:D2}";
+    }
+
+    void OnDeleteAndExclude(string processName)
+    {
+        var msg = $"Delete all history for '{processName}' and stop tracking it from now on?\n\n" +
+                  $"This cannot be undone.";
+        var result = MessageBox.Show(this, msg, "Confirm delete & exclude",
+            MessageBoxButtons.YesNo, MessageBoxIcon.Question, MessageBoxDefaultButton.Button2);
+        if (result != DialogResult.Yes) return;
+
+        try
+        {
+            var deleted = _store.DeleteSessionsForProcess(processName);
+            _store.AddExclusion(processName, "user-hidden", _clock.UtcNow);
+            _onExclusionChanged();
+            ReloadAll();
+            Log.Information("Deleted {N} sessions for {Name} and added exclusion", deleted, processName);
+        }
+        catch (Exception ex)
+        {
+            Log.Error(ex, "Delete & exclude failed for {Name}", processName);
+            MessageBox.Show(this, $"Operation failed: {ex.Message}", "Error",
+                MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
     }
 
     public void ToggleVisible()

@@ -23,6 +23,7 @@ internal sealed class TrayContext : ApplicationContext
     readonly Aggregator _aggregator;
     readonly OwnedIcon _iconActive;
     readonly OwnedIcon _iconPaused;
+    readonly HashSet<string> _excluded = new(StringComparer.OrdinalIgnoreCase);
     bool _lastPausedState;
     ReportForm? _reportForm;
     ToolStripMenuItem? _autostartMenuItem;
@@ -42,6 +43,7 @@ internal sealed class TrayContext : ApplicationContext
 
         _recorder = new SessionRecorder(_store);
         _aggregator = new Aggregator(_store.Connection);
+        RefreshExclusions();
 
         _events = new SessionEventsWindow();
         _events.Locked += OnLocked;
@@ -133,18 +135,29 @@ internal sealed class TrayContext : ApplicationContext
         }
     }
 
+    /// <summary>excluded_processes 테이블을 in-memory 캐시로 다시 로드. UI에서 exclusion 변경 시 호출.</summary>
+    public void RefreshExclusions()
+    {
+        _excluded.Clear();
+        foreach (var name in _store.ListExclusions()) _excluded.Add(name);
+    }
+
     void OnTick(object? sender, EventArgs e)
     {
         try
         {
             var snap = _probe.Sample();
             var now = _clock.UtcNow;
-            _recorder.Tick(snap?.ProcessName, now);
+            var sampleName = snap?.ProcessName;
+            var effectiveName = sampleName is not null && _excluded.Contains(sampleName) ? null : sampleName;
+            _recorder.Tick(effectiveName, now);
 
-            if (snap is { ProcessName: var name, ExePath: { } path } && !string.IsNullOrEmpty(path))
+            if (effectiveName is not null
+                && snap is { ExePath: { } path }
+                && !string.IsNullOrEmpty(path))
             {
-                try { _store.UpsertProcessPath(name, path, now); }
-                catch (Exception ex) { Log.Debug(ex, "UpsertProcessPath failed for {Name}", name); }
+                try { _store.UpsertProcessPath(effectiveName, path, now); }
+                catch (Exception ex) { Log.Debug(ex, "UpsertProcessPath failed for {Name}", effectiveName); }
             }
 
             _notifyIcon.Text = Truncate(
@@ -196,7 +209,7 @@ internal sealed class TrayContext : ApplicationContext
     void OnOpenReport(object? sender, EventArgs e)
     {
         if (_reportForm is null || _reportForm.IsDisposed)
-            _reportForm = new ReportForm(_aggregator, _clock);
+            _reportForm = new ReportForm(_aggregator, _clock, _store, RefreshExclusions);
         _reportForm.ToggleVisible();
     }
 

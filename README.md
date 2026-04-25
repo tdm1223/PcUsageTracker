@@ -6,9 +6,9 @@ Personal Windows PC usage tracker. Tray app that records which process is in the
 
 1. Copy `PcUsageTracker.exe` anywhere (e.g. `%USERPROFILE%\Apps\PcUsageTracker\`).
 2. Double-click to launch. A tray icon appears.
-3. On first run, the app registers itself to start on Windows login via `HKCU\...\Run`. Toggle via tray menu.
+3. On first run, the app registers itself to start on Windows login via `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`. Toggle this on/off any time via tray right-click → **Autostart on Windows login**.
 
-Uninstall: Quit from tray, delete the exe, and optionally remove `%APPDATA%\PcUsageTracker\`.
+Uninstall: Quit from tray, delete the exe, and optionally remove `%APPDATA%\PcUsageTracker\`. Untoggling Autostart removes the Run-key entry.
 
 ## Usage
 
@@ -26,6 +26,21 @@ Uninstall: Quit from tray, delete the exe, and optionally remove `%APPDATA%\PcUs
 - Refreshes every 5 seconds while open.
 - Each row shows the executable's icon (extracted from the exe file), the process name, duration, and a proportional bar.
 - Hovering the process name shows the full exe path.
+- **Right-click any row → "Delete history & stop tracking"** to remove all past sessions for that process and prevent it from being recorded again. Confirmation prompt is shown.
+
+### Excluded processes
+
+Some Windows shell hosts are noisy (foreground every time you press the Windows key). The following are excluded by default on first launch:
+
+- `StartMenuExperienceHost` — Start Menu
+- `ShellExperienceHost` — notification center, action center
+- `SearchHost`, `SearchUI` — search popup
+- `TextInputHost` — touch keyboard / IME
+- `LockApp` — lock screen
+- `ApplicationFrameHost` — UWP app frame wrapper
+- `SystemSettings`
+
+Excluded processes never get recorded. Add more via the report window's right-click menu. Exclusions live in the `excluded_processes` table — feel free to edit directly with a SQLite viewer to remove an exclusion.
 
 ## Data
 
@@ -33,7 +48,7 @@ Uninstall: Quit from tray, delete the exe, and optionally remove `%APPDATA%\PcUs
 - `%APPDATA%\PcUsageTracker\logs\` — rolling daily logs.
 - Retention: unlimited. Open the DB with any SQLite viewer (DB Browser for SQLite, VS Code SQLite extension, etc.).
 
-### Schema (v2)
+### Schema (v3)
 
 ```sql
 CREATE TABLE sessions (
@@ -50,9 +65,16 @@ CREATE TABLE processes (
   exe_path      TEXT,
   last_seen_at  INTEGER NOT NULL
 );
+
+-- Tracking exclusions (system shells + user-hidden processes)
+CREATE TABLE excluded_processes (
+  name         TEXT PRIMARY KEY,
+  reason       TEXT,         -- 'system-ui' | 'user-hidden' | NULL
+  excluded_at  INTEGER NOT NULL
+);
 ```
 
-Migrations are idempotent. Existing v1 DBs are auto-upgraded on first launch.
+Migrations are idempotent. Existing v1/v2 DBs are auto-upgraded on first launch.
 
 ## Behavior
 

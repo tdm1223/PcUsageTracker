@@ -10,7 +10,7 @@ namespace PcUsageTracker.Core.Storage;
 public sealed class SqliteStore : ISessionSink, IDisposable
 {
     public const int OrphanedCapSeconds = 86400; // 비정상 종료 후 복구 시 24시간 cap
-    public const int CurrentSchemaVersion = 2;
+    public const int CurrentSchemaVersion = 3;
 
     readonly SqliteConnection _conn;
 
@@ -111,6 +111,72 @@ public sealed class SqliteStore : ISessionSink, IDisposable
         cmd.Parameters.AddWithValue("$n", processName);
         var v = cmd.ExecuteScalar();
         return v is string s ? s : null;
+    }
+
+    /// <summary>특정 프로세스가 추적 제외 목록에 있는지 확인.</summary>
+    public bool IsExcluded(string processName)
+    {
+        using var cmd = _conn.CreateCommand();
+        cmd.CommandText = "SELECT 1 FROM excluded_processes WHERE name = $n LIMIT 1;";
+        cmd.Parameters.AddWithValue("$n", processName);
+        return cmd.ExecuteScalar() is not null;
+    }
+
+    /// <summary>현재 등록된 모든 제외 프로세스명 반환.</summary>
+    public IReadOnlyList<string> ListExclusions()
+    {
+        using var cmd = _conn.CreateCommand();
+        cmd.CommandText = "SELECT name FROM excluded_processes ORDER BY name;";
+        var list = new List<string>();
+        using var r = cmd.ExecuteReader();
+        while (r.Read()) list.Add(r.GetString(0));
+        return list;
+    }
+
+    /// <summary>제외 목록에 추가 (UPSERT). 이미 있으면 reason/excluded_at 갱신.</summary>
+    public void AddExclusion(string processName, string? reason, DateTimeOffset at)
+    {
+        using var cmd = _conn.CreateCommand();
+        cmd.CommandText = """
+            INSERT INTO excluded_processes (name, reason, excluded_at) VALUES ($n, $r, $t)
+            ON CONFLICT(name) DO UPDATE SET
+              reason = excluded.reason,
+              excluded_at = excluded.excluded_at;
+            """;
+        cmd.Parameters.AddWithValue("$n", processName);
+        cmd.Parameters.AddWithValue("$r", (object?)reason ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("$t", at.ToUnixTimeSeconds());
+        cmd.ExecuteNonQuery();
+    }
+
+    /// <summary>제외 목록에서 제거. 없으면 no-op.</summary>
+    public void RemoveExclusion(string processName)
+    {
+        using var cmd = _conn.CreateCommand();
+        cmd.CommandText = "DELETE FROM excluded_processes WHERE name = $n;";
+        cmd.Parameters.AddWithValue("$n", processName);
+        cmd.ExecuteNonQuery();
+    }
+
+    /// <summary>특정 프로세스의 모든 sessions + processes 메타데이터 삭제. 삭제된 sessions 행 수 반환.</summary>
+    public int DeleteSessionsForProcess(string processName)
+    {
+        using var tx = _conn.BeginTransaction();
+        int deleted;
+        using (var cmd = _conn.CreateCommand())
+        {
+            cmd.Transaction = tx;
+            cmd.CommandText = "DELETE FROM sessions WHERE process_name = $n;";
+            cmd.Parameters.AddWithValue("$n", processName);
+            deleted = cmd.ExecuteNonQuery();
+
+            cmd.Parameters.Clear();
+            cmd.CommandText = "DELETE FROM processes WHERE name = $n;";
+            cmd.Parameters.AddWithValue("$n", processName);
+            cmd.ExecuteNonQuery();
+        }
+        tx.Commit();
+        return deleted;
     }
 
     public void Dispose()

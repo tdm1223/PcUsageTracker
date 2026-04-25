@@ -164,4 +164,83 @@ public class SqliteStoreTests : IDisposable
             Convert.ToInt32(cmd.ExecuteScalar()).Should().Be(1);
         }
     }
+
+    [Fact]
+    public void default_system_ui_processes_are_seeded_as_excluded()
+    {
+        using var store = new SqliteStore(_tmp);
+        store.IsExcluded("StartMenuExperienceHost").Should().BeTrue();
+        store.IsExcluded("ShellExperienceHost").Should().BeTrue();
+        store.IsExcluded("SearchHost").Should().BeTrue();
+        store.IsExcluded("LockApp").Should().BeTrue();
+        store.IsExcluded("chrome").Should().BeFalse();
+    }
+
+    [Fact]
+    public void add_remove_exclusion_roundtrip()
+    {
+        using var store = new SqliteStore(_tmp);
+        store.IsExcluded("notepad").Should().BeFalse();
+
+        store.AddExclusion("notepad", "user-hidden", T(100));
+        store.IsExcluded("notepad").Should().BeTrue();
+
+        // upsert: 두 번째 add는 reason/at 갱신, idempotent
+        store.AddExclusion("notepad", "updated-reason", T(200));
+        store.IsExcluded("notepad").Should().BeTrue();
+
+        store.RemoveExclusion("notepad");
+        store.IsExcluded("notepad").Should().BeFalse();
+
+        // 없는 항목 remove는 no-op
+        store.RemoveExclusion("nonexistent");
+    }
+
+    [Fact]
+    public void list_exclusions_returns_seeded_plus_user_added()
+    {
+        using var store = new SqliteStore(_tmp);
+        var initial = store.ListExclusions();
+        initial.Should().Contain("StartMenuExperienceHost");
+        initial.Should().NotContain("notepad");
+
+        store.AddExclusion("notepad", null, T(0));
+        store.ListExclusions().Should().Contain("notepad");
+    }
+
+    [Fact]
+    public void delete_sessions_for_process_removes_sessions_and_metadata()
+    {
+        using var store = new SqliteStore(_tmp);
+
+        var id1 = store.Open("chrome", T(0));
+        store.Close(id1, T(10));
+        var id2 = store.Open("chrome", T(20));
+        store.Close(id2, T(30));
+        store.UpsertProcessPath("chrome", @"C:\Apps\chrome.exe", T(0));
+
+        var id3 = store.Open("code", T(40));
+        store.Close(id3, T(50));
+
+        var deleted = store.DeleteSessionsForProcess("chrome");
+        deleted.Should().Be(2);
+
+        // sessions에 chrome 사라짐, code는 그대로
+        using var cmd = store.Connection.CreateCommand();
+        cmd.CommandText = "SELECT process_name FROM sessions ORDER BY id;";
+        var remaining = new List<string>();
+        using (var r = cmd.ExecuteReader())
+            while (r.Read()) remaining.Add(r.GetString(0));
+        remaining.Should().BeEquivalentTo(new[] { "code" });
+
+        // processes 메타데이터도 삭제
+        store.GetProcessPath("chrome").Should().BeNull();
+    }
+
+    [Fact]
+    public void delete_sessions_for_process_returns_zero_when_no_match()
+    {
+        using var store = new SqliteStore(_tmp);
+        store.DeleteSessionsForProcess("nonexistent").Should().Be(0);
+    }
 }
