@@ -26,6 +26,46 @@ internal static class RunKeyRegistrar
         }
     }
 
+    public static string? GetRegisteredExePath()
+    {
+        try
+        {
+            using var k = Registry.CurrentUser.OpenSubKey(KeyPath);
+            if (k?.GetValue(ValueName) is not string s) return null;
+            return ParseExePath(s);
+        }
+        catch (Exception ex)
+        {
+            Log.Warning(ex, "RunKeyRegistrar.GetRegisteredExePath failed");
+            return null;
+        }
+    }
+
+    // Run 키 값 포맷: "<exe>" <args...>  또는  <exe> <args...>  또는 단순 <exe>.
+    // 닫는 따옴표가 없는 손상된 값은 null로 방어 처리.
+    internal static string? ParseExePath(string? raw)
+    {
+        if (string.IsNullOrWhiteSpace(raw)) return null;
+        var trimmed = raw.Trim();
+        if (trimmed[0] == '"')
+        {
+            int end = trimmed.IndexOf('"', 1);
+            return end > 1 ? trimmed.Substring(1, end - 1) : null;
+        }
+        int space = trimmed.IndexOf(' ');
+        return space > 0 ? trimmed[..space] : trimmed;
+    }
+
+    public static bool ReconcilePath(string currentExePath)
+    {
+        var registered = GetRegisteredExePath();
+        if (registered is null) return false;
+        if (string.Equals(registered, currentExePath, StringComparison.OrdinalIgnoreCase)) return false;
+        Log.Information("Autostart path drift: registered={Registered} current={Current} — updating",
+            registered, currentExePath);
+        return Register(currentExePath);
+    }
+
     public static bool Register(string exePath)
     {
         try

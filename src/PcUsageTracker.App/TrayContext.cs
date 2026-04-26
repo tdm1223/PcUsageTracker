@@ -68,6 +68,7 @@ internal sealed class TrayContext : ApplicationContext
         _timer.Start();
 
         EnsureAutostartFirstRun();
+        RunKeyRegistrar.ReconcilePath(ExePath);
 
         Log.Information("Tray icon shown (startedFromLogin={FromLogin}, db={Db})", startedFromLogin, dbPath);
     }
