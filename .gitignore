@@ -33,6 +33,10 @@ TestResults/
 # OMC / Ralph workflow state (not source)
 .omc/
 
+# Claude assistant artifacts
+.claude/
+CLAUDE.md
+
 # OS metadata
 Thumbs.db
 .DS_Store
