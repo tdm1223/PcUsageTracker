@@ -169,4 +169,87 @@ public class AggregatorTests : IDisposable
         from.ToLocalTime().DayOfWeek.Should().Be(DayOfWeek.Monday);
         from.ToLocalTime().TimeOfDay.Should().Be(TimeSpan.Zero);
     }
+
+    // 결정적 회귀: 한 주 7일 모두에 대해 from은 그 주 월요일이어야 함.
+    // 2026-05-04 = Monday 인 주(2026-05-04 ~ 2026-05-10) 를 기준으로 7개 local 날짜를 입력으로 검증.
+    [Theory]
+    [InlineData(2026, 5, 4, 12, 2026, 5, 4)]   // Monday → 같은 날 월요일
+    [InlineData(2026, 5, 5, 9, 2026, 5, 4)]    // Tuesday
+    [InlineData(2026, 5, 6, 23, 2026, 5, 4)]   // Wednesday
+    [InlineData(2026, 5, 7, 0, 2026, 5, 4)]    // Thursday
+    [InlineData(2026, 5, 8, 18, 2026, 5, 4)]   // Friday
+    [InlineData(2026, 5, 9, 6, 2026, 5, 4)]    // Saturday
+    [InlineData(2026, 5, 10, 22, 2026, 5, 4)]  // Sunday → 직전 월요일
+    public void week_range_is_monday_for_each_weekday(
+        int y, int m, int d, int hour,
+        int expY, int expM, int expD)
+    {
+        var localOffset = TimeZoneInfo.Local.GetUtcOffset(new DateTime(y, m, d));
+        var local = new DateTimeOffset(y, m, d, hour, 0, 0, localOffset);
+        var nowUtc = local.ToUniversalTime();
+
+        var (from, _) = Aggregator.ThisWeekRange(nowUtc);
+
+        var fromLocal = from.ToLocalTime();
+        fromLocal.DayOfWeek.Should().Be(DayOfWeek.Monday);
+        fromLocal.Year.Should().Be(expY);
+        fromLocal.Month.Should().Be(expM);
+        fromLocal.Day.Should().Be(expD);
+        fromLocal.TimeOfDay.Should().Be(TimeSpan.Zero);
+    }
+
+    [Fact]
+    public void month_range_starts_first_of_local_month()
+    {
+        var now = DateTimeOffset.UtcNow;
+        var (from, to) = Aggregator.ThisMonthRange(now);
+
+        from.ToLocalTime().Day.Should().Be(1);
+        from.ToLocalTime().TimeOfDay.Should().Be(TimeSpan.Zero);
+        to.ToLocalTime().Day.Should().Be(1);
+        to.ToLocalTime().TimeOfDay.Should().Be(TimeSpan.Zero);
+        // 이번 달 마지막 날 23:59:59 가 [from, to) 안에 있어야 한다 — month boundary sanity.
+        var fromLocal = from.ToLocalTime();
+        var lastInstantLocal = fromLocal.AddMonths(1).AddSeconds(-1);
+        lastInstantLocal.Month.Should().Be(fromLocal.Month);
+    }
+
+    [Fact]
+    public void month_range_rolls_over_at_year_end()
+    {
+        // 2026-12-15 12:00 local → from = 2026-12-01 00:00 local, to = 2027-01-01 00:00 local
+        var localOffset = TimeZoneInfo.Local.GetUtcOffset(new DateTime(2026, 12, 15));
+        var local = new DateTimeOffset(2026, 12, 15, 12, 0, 0, localOffset);
+        var nowUtc = local.ToUniversalTime();
+
+        var (from, to) = Aggregator.ThisMonthRange(nowUtc);
+
+        var fromLocal = from.ToLocalTime();
+        fromLocal.Year.Should().Be(2026);
+        fromLocal.Month.Should().Be(12);
+        fromLocal.Day.Should().Be(1);
+        fromLocal.TimeOfDay.Should().Be(TimeSpan.Zero);
+
+        var toLocal = to.ToLocalTime();
+        toLocal.Year.Should().Be(2027);
+        toLocal.Month.Should().Be(1);
+        toLocal.Day.Should().Be(1);
+        toLocal.TimeOfDay.Should().Be(TimeSpan.Zero);
+    }
+
+    [Fact]
+    public void month_range_handles_february_28_or_29()
+    {
+        // 2026-02-15 (2026 is not a leap year) → from = 2026-02-01, to = 2026-03-01
+        var localOffset = TimeZoneInfo.Local.GetUtcOffset(new DateTime(2026, 2, 15));
+        var local = new DateTimeOffset(2026, 2, 15, 8, 30, 0, localOffset);
+        var nowUtc = local.ToUniversalTime();
+
+        var (from, to) = Aggregator.ThisMonthRange(nowUtc);
+
+        from.ToLocalTime().Month.Should().Be(2);
+        from.ToLocalTime().Day.Should().Be(1);
+        to.ToLocalTime().Month.Should().Be(3);
+        to.ToLocalTime().Day.Should().Be(1);
+    }
 }

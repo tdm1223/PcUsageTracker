@@ -158,6 +158,93 @@ public sealed class SqliteStore : ISessionSink, IDisposable
         cmd.ExecuteNonQuery();
     }
 
+    /// <summary>
+    /// 모든 sessions를 (id 오름차순) 스트리밍으로 열거. exe_path는 processes 메타데이터 LEFT JOIN 결과.
+    /// 호출자가 모든 row를 읽을 때까지 underlying reader가 살아있으므로 enumeration 도중 다른 connection write를 시도하지 말 것.
+    /// </summary>
+    public IEnumerable<SessionRow> EnumerateSessions()
+    {
+        using var cmd = _conn.CreateCommand();
+        cmd.CommandText = """
+            SELECT s.process_name, s.start_at, s.end_at, s.duration_sec, p.exe_path
+            FROM sessions s
+            LEFT JOIN processes p ON p.name = s.process_name
+            ORDER BY s.id;
+            """;
+        using var r = cmd.ExecuteReader();
+        while (r.Read())
+        {
+            yield return new SessionRow(
+                ProcessName: r.GetString(0),
+                StartAtUnix: r.GetInt64(1),
+                EndAtUnix: r.IsDBNull(2) ? null : r.GetInt64(2),
+                DurationSec: r.IsDBNull(3) ? null : r.GetInt32(3),
+                ExePath: r.IsDBNull(4) ? null : r.GetString(4));
+        }
+    }
+
+    /// <summary>
+    /// sessions와 processes의 모든 row를 삭제. excluded_processes는 보존(사용자가 명시 추가한 항목 보호).
+    /// 삭제된 sessions 행 수 반환. Replace-import 시 사용.
+    /// </summary>
+    public int ClearAllSessions()
+    {
+        using var tx = _conn.BeginTransaction();
+        int deleted;
+        using (var cmd = _conn.CreateCommand())
+        {
+            cmd.Transaction = tx;
+            cmd.CommandText = "DELETE FROM sessions;";
+            deleted = cmd.ExecuteNonQuery();
+            cmd.CommandText = "DELETE FROM processes;";
+            cmd.ExecuteNonQuery();
+        }
+        tx.Commit();
+        return deleted;
+    }
+
+    /// <summary>
+    /// Excel import 등 외부 입력으로부터 단건 session row를 삽입. duration_sec는 endAt 주어진 경우 자동 계산.
+    /// exePath가 non-null이면 processes 테이블에 UpsertProcessPath와 동일하게 반영.
+    /// 새 session id 반환.
+    /// </summary>
+    public long ImportSession(string processName, DateTimeOffset startAt, DateTimeOffset? endAt, string? exePath)
+    {
+        long id;
+        using var cmd = _conn.CreateCommand();
+        if (endAt is { } e)
+        {
+            var startUnix = startAt.ToUnixTimeSeconds();
+            var endUnix = e.ToUnixTimeSeconds();
+            var duration = endUnix - startUnix;
+            if (duration < 0) duration = 0;
+            cmd.CommandText = """
+                INSERT INTO sessions (process_name, start_at, end_at, duration_sec)
+                VALUES ($p, $s, $e, $d);
+                SELECT last_insert_rowid();
+                """;
+            cmd.Parameters.AddWithValue("$p", processName);
+            cmd.Parameters.AddWithValue("$s", startUnix);
+            cmd.Parameters.AddWithValue("$e", endUnix);
+            cmd.Parameters.AddWithValue("$d", duration);
+        }
+        else
+        {
+            cmd.CommandText = """
+                INSERT INTO sessions (process_name, start_at) VALUES ($p, $s);
+                SELECT last_insert_rowid();
+                """;
+            cmd.Parameters.AddWithValue("$p", processName);
+            cmd.Parameters.AddWithValue("$s", startAt.ToUnixTimeSeconds());
+        }
+        id = (long)cmd.ExecuteScalar()!;
+
+        if (!string.IsNullOrEmpty(exePath))
+            UpsertProcessPath(processName, exePath, endAt ?? startAt);
+
+        return id;
+    }
+
     /// <summary>특정 프로세스의 모든 sessions + processes 메타데이터 삭제. 삭제된 sessions 행 수 반환.</summary>
     public int DeleteSessionsForProcess(string processName)
     {
@@ -184,3 +271,11 @@ public sealed class SqliteStore : ISessionSink, IDisposable
         _conn.Dispose();
     }
 }
+
+/// <summary>EnumerateSessions / Excel I/O 가 사용하는 sessions 테이블 row 표현.</summary>
+public readonly record struct SessionRow(
+    string ProcessName,
+    long StartAtUnix,
+    long? EndAtUnix,
+    int? DurationSec,
+    string? ExePath);

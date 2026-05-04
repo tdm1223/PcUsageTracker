@@ -18,6 +18,7 @@ internal sealed class ReportForm : Form
     readonly Action _onExclusionChanged;
     readonly DataGridView _todayGrid;
     readonly DataGridView _weekGrid;
+    readonly DataGridView _monthGrid;
     readonly DataGridView _allGrid;
     readonly System.Windows.Forms.Timer _refresh;
     readonly IconCache _iconCache = new();
@@ -36,20 +37,23 @@ internal sealed class ReportForm : Form
 
         var tabs = new TabControl { Dock = DockStyle.Fill };
 
-        var tab1 = new TabPage("Today + Week");
+        var tab1 = new TabPage("Today + Week + Month");
         var split = new TableLayoutPanel
         {
             Dock = DockStyle.Fill,
-            ColumnCount = 2,
+            ColumnCount = 3,
             RowCount = 1,
         };
-        split.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50));
-        split.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50));
+        split.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 33.34f));
+        split.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 33.33f));
+        split.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 33.33f));
 
         _todayGrid = BuildGrid(this);
         _weekGrid = BuildGrid(this);
+        _monthGrid = BuildGrid(this);
         split.Controls.Add(WrapWithHeader("Today (top 5)", _todayGrid), 0, 0);
         split.Controls.Add(WrapWithHeader("This week (top 5)", _weekGrid), 1, 0);
+        split.Controls.Add(WrapWithHeader("This month (top 5)", _monthGrid), 2, 0);
         tab1.Controls.Add(split);
 
         var tab2 = new TabPage("All-time top 20");
@@ -190,11 +194,15 @@ internal sealed class ReportForm : Form
         var now = _clock.UtcNow;
         var (todayFrom, todayTo) = Aggregator.TodayRange(now);
         var (weekFrom, weekTo) = Aggregator.ThisWeekRange(now);
+        var (monthFrom, monthTo) = Aggregator.ThisMonthRange(now);
 
         Populate(_todayGrid, _agg.TopN(todayFrom, todayTo, now, TodayWeekTopN));
         Populate(_weekGrid, _agg.TopN(weekFrom, weekTo, now, TodayWeekTopN));
+        Populate(_monthGrid, _agg.TopN(monthFrom, monthTo, now, TodayWeekTopN));
         Populate(_allGrid, _agg.AllTime(now, AllTimeTopN));
     }
+
+    public void RequestReload() => ReloadAll();
 
     void Populate(DataGridView grid, IReadOnlyList<ReportEntry> entries)
     {

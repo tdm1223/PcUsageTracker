@@ -243,4 +243,113 @@ public class SqliteStoreTests : IDisposable
         using var store = new SqliteStore(_tmp);
         store.DeleteSessionsForProcess("nonexistent").Should().Be(0);
     }
+
+    [Fact]
+    public void enumerate_sessions_yields_rows_with_metadata_join()
+    {
+        using var store = new SqliteStore(_tmp);
+        var id1 = store.Open("chrome", T(0));
+        store.Close(id1, T(60));
+        store.UpsertProcessPath("chrome", @"C:\Apps\chrome.exe", T(0));
+
+        store.Open("code", T(100)); // open session — end_at NULL
+
+        var rows = store.EnumerateSessions().ToList();
+        rows.Should().HaveCount(2);
+
+        rows[0].ProcessName.Should().Be("chrome");
+        rows[0].StartAtUnix.Should().Be(T(0).ToUnixTimeSeconds());
+        rows[0].EndAtUnix.Should().Be(T(60).ToUnixTimeSeconds());
+        rows[0].DurationSec.Should().Be(60);
+        rows[0].ExePath.Should().Be(@"C:\Apps\chrome.exe");
+
+        rows[1].ProcessName.Should().Be("code");
+        rows[1].EndAtUnix.Should().BeNull();
+        rows[1].DurationSec.Should().BeNull();
+        rows[1].ExePath.Should().BeNull();
+    }
+
+    [Fact]
+    public void clear_all_sessions_wipes_sessions_and_processes_but_preserves_exclusions()
+    {
+        using var store = new SqliteStore(_tmp);
+        var id = store.Open("chrome", T(0));
+        store.Close(id, T(60));
+        store.UpsertProcessPath("chrome", @"C:\Apps\chrome.exe", T(0));
+        store.AddExclusion("MyApp", "user-hidden", T(10));
+
+        var deleted = store.ClearAllSessions();
+        deleted.Should().Be(1);
+
+        store.EnumerateSessions().Should().BeEmpty();
+        store.GetProcessPath("chrome").Should().BeNull();
+
+        // 사용자가 명시 추가한 exclusion + 시드된 system-ui 항목 모두 보존
+        store.IsExcluded("MyApp").Should().BeTrue();
+        store.IsExcluded("StartMenuExperienceHost").Should().BeTrue();
+    }
+
+    [Fact]
+    public void clear_all_sessions_returns_zero_on_empty_db()
+    {
+        using var store = new SqliteStore(_tmp);
+        store.ClearAllSessions().Should().Be(0);
+    }
+
+    [Fact]
+    public void import_session_with_end_persists_duration_and_path()
+    {
+        using var store = new SqliteStore(_tmp);
+        var id = store.ImportSession("notepad", T(100), T(160), @"C:\Windows\notepad.exe");
+        id.Should().BeGreaterThan(0);
+
+        var rows = store.EnumerateSessions().ToList();
+        rows.Should().HaveCount(1);
+        rows[0].ProcessName.Should().Be("notepad");
+        rows[0].StartAtUnix.Should().Be(T(100).ToUnixTimeSeconds());
+        rows[0].EndAtUnix.Should().Be(T(160).ToUnixTimeSeconds());
+        rows[0].DurationSec.Should().Be(60);
+        rows[0].ExePath.Should().Be(@"C:\Windows\notepad.exe");
+
+        store.GetProcessPath("notepad").Should().Be(@"C:\Windows\notepad.exe");
+    }
+
+    [Fact]
+    public void import_session_without_end_leaves_end_null()
+    {
+        using var store = new SqliteStore(_tmp);
+        store.ImportSession("foo", T(0), null, exePath: null);
+
+        var rows = store.EnumerateSessions().ToList();
+        rows.Should().HaveCount(1);
+        rows[0].EndAtUnix.Should().BeNull();
+        rows[0].DurationSec.Should().BeNull();
+        rows[0].ExePath.Should().BeNull();
+    }
+
+    [Fact]
+    public void import_session_clamps_negative_duration_to_zero()
+    {
+        using var store = new SqliteStore(_tmp);
+        // end < start (잘못된 import 데이터) → duration_sec 가 음수가 되지 않게 0 으로 클램프
+        store.ImportSession("foo", T(100), T(50), null);
+
+        var rows = store.EnumerateSessions().ToList();
+        rows[0].DurationSec.Should().Be(0);
+    }
+
+    [Fact]
+    public void enumerate_after_clear_then_import_returns_only_new()
+    {
+        using var store = new SqliteStore(_tmp);
+        var id = store.Open("chrome", T(0));
+        store.Close(id, T(10));
+        store.ClearAllSessions();
+
+        store.ImportSession("code", T(100), T(160), null);
+
+        var rows = store.EnumerateSessions().ToList();
+        rows.Should().HaveCount(1);
+        rows[0].ProcessName.Should().Be("code");
+    }
 }

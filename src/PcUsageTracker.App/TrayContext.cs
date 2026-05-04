@@ -107,6 +107,10 @@ internal sealed class TrayContext : ApplicationContext
         menu.Items.Add("Open report", image: null, OnOpenReport);
         menu.Items.Add(new ToolStripSeparator());
 
+        menu.Items.Add("Export to Excel...", image: null, OnExportExcel);
+        menu.Items.Add("Import from Excel...", image: null, OnImportExcel);
+        menu.Items.Add(new ToolStripSeparator());
+
         _autostartMenuItem = new ToolStripMenuItem("Autostart on Windows login")
         {
             CheckOnClick = true,
@@ -119,6 +123,95 @@ internal sealed class TrayContext : ApplicationContext
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add("Quit", image: null, OnQuit);
         return menu;
+    }
+
+    void OnExportExcel(object? sender, EventArgs e)
+    {
+        using var dlg = new SaveFileDialog
+        {
+            Title = "Export usage history to Excel",
+            Filter = "Excel workbook (*.xlsx)|*.xlsx",
+            FileName = $"pc-usage-{DateTimeOffset.Now:yyyyMMdd}.xlsx",
+            OverwritePrompt = true,
+        };
+        if (dlg.ShowDialog() != DialogResult.OK) return;
+
+        try
+        {
+            var written = ExcelStorage.Export(_store, dlg.FileName);
+            Log.Information("Excel export complete: {N} sessions → {Path}", written, dlg.FileName);
+            MessageBox.Show(
+                $"{written} session(s) exported.\n\n{dlg.FileName}",
+                "Export complete", MessageBoxButtons.OK, MessageBoxIcon.Information);
+        }
+        catch (Exception ex)
+        {
+            Log.Error(ex, "Excel export failed for {Path}", dlg.FileName);
+            MessageBox.Show($"Export failed:\n\n{ex.Message}", "Error",
+                MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
+    }
+
+    void OnImportExcel(object? sender, EventArgs e)
+    {
+        using var dlg = new OpenFileDialog
+        {
+            Title = "Import usage history from Excel",
+            Filter = "Excel workbook (*.xlsx)|*.xlsx",
+            CheckFileExists = true,
+        };
+        if (dlg.ShowDialog() != DialogResult.OK) return;
+
+        var mode = AskImportMode();
+        if (mode is null) return;
+
+        if (mode == ImportMode.Replace)
+        {
+            var confirm = MessageBox.Show(
+                "This will delete all existing usage history and replace it with the imported file.\n\nContinue?",
+                "Confirm replace", MessageBoxButtons.YesNo, MessageBoxIcon.Warning, MessageBoxDefaultButton.Button2);
+            if (confirm != DialogResult.Yes) return;
+        }
+
+        try
+        {
+            var imported = ExcelStorage.Import(_store, dlg.FileName, mode.Value);
+            Log.Information("Excel import complete: {N} sessions ({Mode}) ← {Path}", imported, mode, dlg.FileName);
+
+            if (_reportForm is { IsDisposed: false, Visible: true })
+                _reportForm.RequestReload();
+
+            MessageBox.Show(
+                $"{imported} session(s) imported ({mode}).",
+                "Import complete", MessageBoxButtons.OK, MessageBoxIcon.Information);
+        }
+        catch (Exception ex)
+        {
+            Log.Error(ex, "Excel import failed for {Path}", dlg.FileName);
+            MessageBox.Show($"Import failed:\n\n{ex.Message}", "Error",
+                MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
+    }
+
+    static ImportMode? AskImportMode()
+    {
+        // Append / Replace / Cancel — 3-button MessageBox로 단순 처리.
+        // YesNoCancel: Yes=Append (기본), No=Replace, Cancel=Cancel
+        var result = MessageBox.Show(
+            "Import mode:\n\n" +
+            "  Yes — Append to existing data\n" +
+            "  No — Replace all existing data\n" +
+            "  Cancel — Abort",
+            "Choose import mode",
+            MessageBoxButtons.YesNoCancel,
+            MessageBoxIcon.Question,
+            MessageBoxDefaultButton.Button1);
+        return result switch
+        {
+            DialogResult.Yes => ImportMode.Append,
+            DialogResult.No => ImportMode.Replace,
+            _ => null,
+        };
     }
 
     void OnAutostartToggled(object? sender, EventArgs e)

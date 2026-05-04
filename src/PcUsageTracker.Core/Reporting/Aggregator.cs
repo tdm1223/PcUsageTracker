@@ -108,4 +108,13 @@ public sealed class Aggregator
         var nextMondayLocal = mondayLocal.AddDays(7);
         return (mondayLocal.ToUniversalTime(), nextMondayLocal.ToUniversalTime());
     }
+
+    /// <summary>local time 기준 이번 달 1일 00:00 ~ 다음 달 1일 00:00 을 UTC 범위로 반환.</summary>
+    public static (DateTimeOffset fromUtc, DateTimeOffset toUtc) ThisMonthRange(DateTimeOffset nowUtc)
+    {
+        var local = nowUtc.ToLocalTime();
+        var startLocal = new DateTimeOffset(local.Year, local.Month, 1, 0, 0, 0, local.Offset);
+        var nextLocal = startLocal.AddMonths(1);
+        return (startLocal.ToUniversalTime(), nextLocal.ToUniversalTime());
+    }
 }
