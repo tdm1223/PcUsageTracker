@@ -7,8 +7,6 @@ namespace PcUsageTracker.App;
 
 internal sealed class ReportForm : Form
 {
-    const int TodayWeekTopN = 5;
-    const int AllTimeTopN = 20;
     const int RefreshMs = 5000;
     const int IconColWidth = 24;
 
@@ -51,14 +49,14 @@ internal sealed class ReportForm : Form
         _todayGrid = BuildGrid(this);
         _weekGrid = BuildGrid(this);
         _monthGrid = BuildGrid(this);
-        split.Controls.Add(WrapWithHeader("Today (top 5)", _todayGrid), 0, 0);
-        split.Controls.Add(WrapWithHeader("This week (top 5)", _weekGrid), 1, 0);
-        split.Controls.Add(WrapWithHeader("This month (top 5)", _monthGrid), 2, 0);
+        split.Controls.Add(WrapWithHeader("Today", _todayGrid), 0, 0);
+        split.Controls.Add(WrapWithHeader("This week", _weekGrid), 1, 0);
+        split.Controls.Add(WrapWithHeader("This month", _monthGrid), 2, 0);
         tab1.Controls.Add(split);
 
-        var tab2 = new TabPage("All-time top 20");
+        var tab2 = new TabPage("All-time");
         _allGrid = BuildGrid(this);
-        tab2.Controls.Add(WrapWithHeader("All-time top 20", _allGrid));
+        tab2.Controls.Add(WrapWithHeader("All-time", _allGrid));
 
         tabs.TabPages.Add(tab1);
         tabs.TabPages.Add(tab2);
@@ -120,11 +118,11 @@ internal sealed class ReportForm : Form
         });
         g.Columns.Add(new DataGridViewTextBoxColumn
         {
-            Name = "Bar",
-            HeaderText = "",
-            FillWeight = 35,
+            Name = "Share",
+            HeaderText = "Share",
+            FillWeight = 20,
+            DefaultCellStyle = new DataGridViewCellStyle { Alignment = DataGridViewContentAlignment.MiddleRight },
         });
-        g.CellPainting += OnCellPainting;
 
         // 우클릭 → 행 선택 + 컨텍스트 메뉴
         var menu = new ContextMenuStrip();
@@ -170,25 +168,6 @@ internal sealed class ReportForm : Form
         return panel;
     }
 
-    static void OnCellPainting(object? sender, DataGridViewCellPaintingEventArgs e)
-    {
-        if (e.RowIndex < 0 || e.ColumnIndex < 0) return;
-        var grid = (DataGridView)sender!;
-        if (grid.Columns[e.ColumnIndex].Name != "Bar") return;
-
-        e.PaintBackground(e.ClipBounds, true);
-        if (e.Value is double ratio && ratio > 0 && e.Graphics is { } g)
-        {
-            var pad = 3;
-            var cw = e.CellBounds.Width - pad * 2;
-            var barW = Math.Max(1, (int)(cw * Math.Clamp(ratio, 0.0, 1.0)));
-            var rect = new Rectangle(e.CellBounds.X + pad, e.CellBounds.Y + pad + 2, barW, e.CellBounds.Height - pad * 2 - 4);
-            using var brush = new SolidBrush(Color.SteelBlue);
-            g.FillRectangle(brush, rect);
-        }
-        e.Handled = true;
-    }
-
     void ReloadAll()
     {
         var now = _clock.UtcNow;
@@ -196,10 +175,10 @@ internal sealed class ReportForm : Form
         var (weekFrom, weekTo) = Aggregator.ThisWeekRange(now);
         var (monthFrom, monthTo) = Aggregator.ThisMonthRange(now);
 
-        Populate(_todayGrid, _agg.TopN(todayFrom, todayTo, now, TodayWeekTopN));
-        Populate(_weekGrid, _agg.TopN(weekFrom, weekTo, now, TodayWeekTopN));
-        Populate(_monthGrid, _agg.TopN(monthFrom, monthTo, now, TodayWeekTopN));
-        Populate(_allGrid, _agg.AllTime(now, AllTimeTopN));
+        Populate(_todayGrid, _agg.TopN(todayFrom, todayTo, now));
+        Populate(_weekGrid, _agg.TopN(weekFrom, weekTo, now));
+        Populate(_monthGrid, _agg.TopN(monthFrom, monthTo, now));
+        Populate(_allGrid, _agg.AllTime(now));
     }
 
     public void RequestReload() => ReloadAll();
@@ -209,13 +188,12 @@ internal sealed class ReportForm : Form
         grid.Rows.Clear();
         if (entries.Count == 0) return;
 
-        var max = entries.Max(r => r.TotalSeconds);
+        long total = entries.Sum(r => (long)r.TotalSeconds);
         foreach (var e in entries)
         {
-            var ratio = max > 0 ? (double)e.TotalSeconds / max : 0.0;
+            var pct = total > 0 ? (double)e.TotalSeconds / total * 100.0 : 0.0;
             var icon = _iconCache.Get(e.ExePath);
-            var idx = grid.Rows.Add(icon, e.ProcessName, FormatDuration(e.TotalSeconds), ratio);
-            grid.Rows[idx].Cells["Bar"].ToolTipText = $"{ratio * 100:0.0}% of top";
+            var idx = grid.Rows.Add(icon, e.ProcessName, FormatDuration(e.TotalSeconds), $"{pct:0.0}%");
             if (!string.IsNullOrEmpty(e.ExePath))
                 grid.Rows[idx].Cells["Process"].ToolTipText = e.ExePath;
         }

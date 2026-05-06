@@ -89,6 +89,74 @@ public sealed class Aggregator
         return result;
     }
 
+    /// <summary>지정 기간 [fromUtc, toUtc)의 프로세스별 누적 — 전체 행(무제한). total DESC 정렬.</summary>
+    public IReadOnlyList<ReportEntry> TopN(DateTimeOffset fromUtc, DateTimeOffset toUtc, DateTimeOffset nowUtc)
+    {
+        if (toUtc <= fromUtc) return Array.Empty<ReportEntry>();
+
+        using var cmd = _conn.CreateCommand();
+        cmd.CommandText = """
+            WITH clipped AS (
+              SELECT
+                process_name,
+                MAX(start_at, $from) AS s,
+                MIN(COALESCE(end_at, $now), $to) AS e
+              FROM sessions
+              WHERE start_at < $to
+                AND COALESCE(end_at, $now) > $from
+            ),
+            summed AS (
+              SELECT process_name, SUM(e - s) AS total
+              FROM clipped
+              WHERE e > s
+              GROUP BY process_name
+            )
+            SELECT s.process_name, s.total, p.exe_path
+            FROM summed s
+            LEFT JOIN processes p ON p.name = s.process_name
+            ORDER BY s.total DESC;
+            """;
+        cmd.Parameters.AddWithValue("$from", fromUtc.ToUnixTimeSeconds());
+        cmd.Parameters.AddWithValue("$to", toUtc.ToUnixTimeSeconds());
+        cmd.Parameters.AddWithValue("$now", nowUtc.ToUnixTimeSeconds());
+
+        var result = new List<ReportEntry>();
+        using var r = cmd.ExecuteReader();
+        while (r.Read())
+        {
+            var path = r.IsDBNull(2) ? null : r.GetString(2);
+            result.Add(new ReportEntry(r.GetString(0), Convert.ToInt32(r.GetInt64(1)), path));
+        }
+        return result;
+    }
+
+    /// <summary>전 기간 누적 — 전체 행(무제한). total DESC 정렬.</summary>
+    public IReadOnlyList<ReportEntry> AllTime(DateTimeOffset nowUtc)
+    {
+        using var cmd = _conn.CreateCommand();
+        cmd.CommandText = """
+            WITH summed AS (
+              SELECT process_name, SUM(COALESCE(end_at, $now) - start_at) AS total
+              FROM sessions
+              GROUP BY process_name
+            )
+            SELECT s.process_name, s.total, p.exe_path
+            FROM summed s
+            LEFT JOIN processes p ON p.name = s.process_name
+            ORDER BY s.total DESC;
+            """;
+        cmd.Parameters.AddWithValue("$now", nowUtc.ToUnixTimeSeconds());
+
+        var result = new List<ReportEntry>();
+        using var r = cmd.ExecuteReader();
+        while (r.Read())
+        {
+            var path = r.IsDBNull(2) ? null : r.GetString(2);
+            result.Add(new ReportEntry(r.GetString(0), Convert.ToInt32(r.GetInt64(1)), path));
+        }
+        return result;
+    }
+
     /// <summary>local time 기준 오늘 00:00 ~ 내일 00:00 을 UTC 범위로 반환.</summary>
     public static (DateTimeOffset fromUtc, DateTimeOffset toUtc) TodayRange(DateTimeOffset nowUtc)
     {

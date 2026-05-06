@@ -151,6 +151,46 @@ public class AggregatorTests : IDisposable
     }
 
     [Fact]
+    public void top_all_returns_every_process_in_range()
+    {
+        // 7개 프로세스 시드 — 무제한 오버로드는 전부 반환해야 함.
+        for (int i = 0; i < 7; i++)
+            Seed($"proc{i}", i * 100, i * 100 + 10 + i);
+
+        var result = _agg.TopN(T(0), T(10_000), T(10_000));
+
+        result.Should().HaveCount(7);
+    }
+
+    [Fact]
+    public void all_time_unbounded_returns_every_process()
+    {
+        // 25개 프로세스 — 기존 limit=20 호출은 20만 반환했지만 무제한은 25개 모두.
+        for (int i = 0; i < 25; i++)
+            Seed($"proc{i:D2}", i * 100, i * 100 + 5 + i);
+
+        var unbounded = _agg.AllTime(T(100_000));
+        var limited = _agg.AllTime(T(100_000), 20);
+
+        unbounded.Should().HaveCount(25);
+        limited.Should().HaveCount(20);
+    }
+
+    [Fact]
+    public void unbounded_overloads_preserve_total_desc_order()
+    {
+        Seed("small", 0, 10);
+        Seed("big", 0, 1000);
+        Seed("medium", 0, 100);
+
+        var topAll = _agg.TopN(T(0), T(10_000), T(10_000));
+        topAll.Select(r => r.ProcessName).Should().ContainInOrder("big", "medium", "small");
+
+        var allUnbounded = _agg.AllTime(T(10_000));
+        allUnbounded.Select(r => r.ProcessName).Should().ContainInOrder("big", "medium", "small");
+    }
+
+    [Fact]
     public void today_range_covers_local_midnight_to_midnight()
     {
         var now = DateTimeOffset.UtcNow;
