@@ -10,7 +10,7 @@ namespace PcUsageTracker.Core.Storage;
 public sealed class SqliteStore : ISessionSink, IDisposable
 {
     public const int OrphanedCapSeconds = 86400; // 비정상 종료 후 복구 시 24시간 cap
-    public const int CurrentSchemaVersion = 3;
+    public const int CurrentSchemaVersion = 4;
 
     readonly SqliteConnection _conn;
 
@@ -243,6 +243,29 @@ public sealed class SqliteStore : ISessionSink, IDisposable
             UpsertProcessPath(processName, exePath, endAt ?? startAt);
 
         return id;
+    }
+
+    /// <summary>settings 테이블에서 key의 value를 반환. 없으면 null.</summary>
+    public string? GetSetting(string key)
+    {
+        using var cmd = _conn.CreateCommand();
+        cmd.CommandText = "SELECT value FROM settings WHERE key = $k;";
+        cmd.Parameters.AddWithValue("$k", key);
+        var v = cmd.ExecuteScalar();
+        return v is string s ? s : null;
+    }
+
+    /// <summary>settings 테이블에 (key, value) UPSERT. 이미 있으면 value 갱신.</summary>
+    public void SetSetting(string key, string value)
+    {
+        using var cmd = _conn.CreateCommand();
+        cmd.CommandText = """
+            INSERT INTO settings (key, value) VALUES ($k, $v)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value;
+            """;
+        cmd.Parameters.AddWithValue("$k", key);
+        cmd.Parameters.AddWithValue("$v", value);
+        cmd.ExecuteNonQuery();
     }
 
     /// <summary>특정 프로세스의 모든 sessions + processes 메타데이터 삭제. 삭제된 sessions 행 수 반환.</summary>

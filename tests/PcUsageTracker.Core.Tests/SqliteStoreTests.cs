@@ -352,4 +352,92 @@ public class SqliteStoreTests : IDisposable
         rows.Should().HaveCount(1);
         rows[0].ProcessName.Should().Be("code");
     }
+
+    [Fact]
+    public void settings_get_returns_null_when_absent()
+    {
+        using var store = new SqliteStore(_tmp);
+        store.GetSetting("idle_threshold_sec").Should().BeNull();
+    }
+
+    [Fact]
+    public void settings_set_then_get_roundtrips()
+    {
+        using var store = new SqliteStore(_tmp);
+        store.SetSetting("idle_threshold_sec", "180");
+        store.GetSetting("idle_threshold_sec").Should().Be("180");
+    }
+
+    [Fact]
+    public void settings_set_is_upsert_on_existing_key()
+    {
+        using var store = new SqliteStore(_tmp);
+        store.SetSetting("idle_threshold_sec", "180");
+        store.SetSetting("idle_threshold_sec", "300");
+        store.GetSetting("idle_threshold_sec").Should().Be("300");
+    }
+
+    [Fact]
+    public void migration_v3_db_upgrades_to_v4_preserving_data()
+    {
+        // v3 시점 DB를 손수 제작: schema_version=3, settings 테이블 없음, 기존 데이터 시드.
+        using (var conn = new Microsoft.Data.Sqlite.SqliteConnection($"Data Source={_tmp}"))
+        {
+            conn.Open();
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = """
+                CREATE TABLE schema_version (version INTEGER PRIMARY KEY);
+                INSERT INTO schema_version VALUES (1);
+                INSERT INTO schema_version VALUES (2);
+                INSERT INTO schema_version VALUES (3);
+
+                CREATE TABLE sessions (
+                  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                  process_name  TEXT    NOT NULL,
+                  start_at      INTEGER NOT NULL,
+                  end_at        INTEGER,
+                  duration_sec  INTEGER
+                );
+                INSERT INTO sessions (process_name, start_at, end_at, duration_sec)
+                VALUES ('chrome', 1000, 1060, 60);
+
+                CREATE TABLE processes (
+                  name          TEXT PRIMARY KEY,
+                  exe_path      TEXT,
+                  last_seen_at  INTEGER NOT NULL
+                );
+                INSERT INTO processes (name, exe_path, last_seen_at)
+                VALUES ('chrome', 'C:\Apps\chrome.exe', 1000);
+
+                CREATE TABLE excluded_processes (
+                  name         TEXT PRIMARY KEY,
+                  reason       TEXT,
+                  excluded_at  INTEGER NOT NULL
+                );
+                INSERT INTO excluded_processes (name, reason, excluded_at)
+                VALUES ('LegacyApp', 'user-hidden', 999);
+                """;
+            cmd.ExecuteNonQuery();
+        }
+        Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools();
+
+        using var store = new SqliteStore(_tmp);
+
+        // 스키마 버전 4로 올라감
+        Migrations.ReadVersion(store.Connection).Should().Be(SqliteStore.CurrentSchemaVersion);
+        SqliteStore.CurrentSchemaVersion.Should().Be(4);
+
+        // 기존 데이터 보존
+        store.EnumerateSessions().Should().HaveCount(1);
+        store.GetProcessPath("chrome").Should().Be(@"C:\Apps\chrome.exe");
+        store.IsExcluded("LegacyApp").Should().BeTrue();
+
+        // V3 시드(시스템 UI 제외)가 v3→v4 업그레이드 경로에서도 INSERT OR IGNORE로 채워졌는지 검증
+        store.IsExcluded("StartMenuExperienceHost").Should().BeTrue();
+
+        // 새 settings 테이블 사용 가능
+        store.GetSetting("idle_threshold_sec").Should().BeNull();
+        store.SetSetting("idle_threshold_sec", "180");
+        store.GetSetting("idle_threshold_sec").Should().Be("180");
+    }
 }

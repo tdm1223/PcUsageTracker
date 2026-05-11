@@ -38,6 +38,14 @@ public static class Migrations
         INSERT OR IGNORE INTO schema_version VALUES (3);
         """;
 
+    const string V4 = """
+        CREATE TABLE IF NOT EXISTS settings (
+          key    TEXT PRIMARY KEY,
+          value  TEXT NOT NULL
+        );
+        INSERT OR IGNORE INTO schema_version VALUES (4);
+        """;
+
     /// <summary>v3 시드: Windows 시스템 UI 호스트 프로세스. 시작메뉴/검색/잠금 등 노이즈 차단.</summary>
     static readonly string[] DefaultSystemUiExclusions = new[]
     {
@@ -63,6 +71,8 @@ public static class Migrations
             cmd.CommandText = V2;
             cmd.ExecuteNonQuery();
             cmd.CommandText = V3;
+            cmd.ExecuteNonQuery();
+            cmd.CommandText = V4;
             cmd.ExecuteNonQuery();
         }
 

@@ -12,11 +12,15 @@ namespace PcUsageTracker.App;
 internal sealed class TrayContext : ApplicationContext
 {
     const int TickIntervalMs = 1000;
+    const int DefaultIdleThresholdSec = 180;
+    const string IdleThresholdSettingKey = "idle_threshold_sec";
 
     readonly NotifyIcon _notifyIcon;
     readonly SqliteStore _store;
     readonly SessionRecorder _recorder;
     readonly IForegroundProbe _probe;
+    readonly IIdleProbe _idleProbe;
+    readonly IdleDetector _idleDetector;
     readonly IClock _clock;
     readonly System.Windows.Forms.Timer _timer;
     readonly SessionEventsWindow _events;
@@ -25,6 +29,7 @@ internal sealed class TrayContext : ApplicationContext
     readonly OwnedIcon _iconPaused;
     readonly HashSet<string> _excluded = new(StringComparer.OrdinalIgnoreCase);
     bool _lastPausedState;
+    bool _lastIdleState;
     ReportForm? _reportForm;
     ToolStripMenuItem? _autostartMenuItem;
 
@@ -32,6 +37,7 @@ internal sealed class TrayContext : ApplicationContext
     {
         _clock = new SystemClock();
         _probe = new Win32ForegroundProbe();
+        _idleProbe = new Win32IdleProbe();
 
         var dataDir = GetDataFolder();
         Directory.CreateDirectory(dataDir);
@@ -43,6 +49,7 @@ internal sealed class TrayContext : ApplicationContext
 
         _recorder = new SessionRecorder(_store);
         _aggregator = new Aggregator(_store.Connection);
+        _idleDetector = new IdleDetector(TimeSpan.FromSeconds(LoadIdleThresholdSec()));
         RefreshExclusions();
 
         _events = new SessionEventsWindow();
@@ -109,6 +116,9 @@ internal sealed class TrayContext : ApplicationContext
 
         menu.Items.Add("Export to Excel...", image: null, OnExportExcel);
         menu.Items.Add("Import from Excel...", image: null, OnImportExcel);
+        menu.Items.Add(new ToolStripSeparator());
+
+        menu.Items.Add("Idle threshold...", image: null, OnIdleSettings);
         menu.Items.Add(new ToolStripSeparator());
 
         _autostartMenuItem = new ToolStripMenuItem("Autostart on Windows login")
@@ -214,6 +224,30 @@ internal sealed class TrayContext : ApplicationContext
         };
     }
 
+    void OnIdleSettings(object? sender, EventArgs e)
+    {
+        var currentSec = (int)_idleDetector.Threshold.TotalSeconds;
+        // 초→분 변환: 정수 분 표시. ceil로 60초 미만이어도 최소 1분 보이게.
+        var currentMinutes = Math.Max(1, (currentSec + 59) / 60);
+
+        using var dlg = new IdleSettingsForm(currentMinutes);
+        if (dlg.ShowDialog() != DialogResult.OK) return;
+
+        var newSec = dlg.Minutes * 60;
+        try
+        {
+            _store.SetSetting(IdleThresholdSettingKey, newSec.ToString());
+            _idleDetector.SetThreshold(TimeSpan.FromSeconds(newSec));
+            Log.Information("Idle threshold updated to {Min} minutes", dlg.Minutes);
+        }
+        catch (Exception ex)
+        {
+            Log.Error(ex, "Failed updating idle threshold");
+            MessageBox.Show($"Failed to save idle threshold:\n\n{ex.Message}", "Error",
+                MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
+    }
+
     void OnAutostartToggled(object? sender, EventArgs e)
     {
         if (_autostartMenuItem is null) return;
@@ -242,8 +276,29 @@ internal sealed class TrayContext : ApplicationContext
         {
             var snap = _probe.Sample();
             var now = _clock.UtcNow;
+
+            // Lock/Suspend Pause()가 우선. Pause 상태에서는 Tick이 no-op이므로 idle 검사 무의미.
+            bool isIdle = false;
+            if (!_recorder.IsPaused)
+            {
+                isIdle = _idleDetector.Update(_idleProbe.IdleDuration);
+                if (isIdle != _lastIdleState)
+                {
+                    Log.Information(isIdle
+                        ? "User idle detected — pausing tracking"
+                        : "User returned — resuming tracking");
+                    _lastIdleState = isIdle;
+                }
+            }
+            else if (_lastIdleState)
+            {
+                // Pause 진입 시 idle 상태도 리셋해서 다음 unlock 후 첫 tick에서 정상 전이 로그가 나오게 한다.
+                _lastIdleState = false;
+            }
+
             var sampleName = snap?.ProcessName;
             var effectiveName = sampleName is not null && _excluded.Contains(sampleName) ? null : sampleName;
+            if (isIdle) effectiveName = null;
             _recorder.Tick(effectiveName, now);
 
             if (effectiveName is not null
@@ -255,19 +310,29 @@ internal sealed class TrayContext : ApplicationContext
             }
 
             _notifyIcon.Text = Truncate(
-                _recorder.IsPaused ? "PcUsageTracker (paused)" : $"Tracking: {_recorder.CurrentProcessName ?? "-"}",
+                _recorder.IsPaused ? "PcUsageTracker (paused)"
+                : isIdle ? "PcUsageTracker (idle)"
+                : $"Tracking: {_recorder.CurrentProcessName ?? "-"}",
                 63);
 
-            if (_recorder.IsPaused != _lastPausedState)
+            bool wantsPausedIcon = _recorder.IsPaused || isIdle;
+            if (wantsPausedIcon != _lastPausedState)
             {
-                _notifyIcon.Icon = _recorder.IsPaused ? _iconPaused.Icon : _iconActive.Icon;
-                _lastPausedState = _recorder.IsPaused;
+                _notifyIcon.Icon = wantsPausedIcon ? _iconPaused.Icon : _iconActive.Icon;
+                _lastPausedState = wantsPausedIcon;
             }
         }
         catch (Exception ex)
         {
             Log.Error(ex, "Tick failed");
         }
+    }
+
+    int LoadIdleThresholdSec()
+    {
+        var raw = _store.GetSetting(IdleThresholdSettingKey);
+        if (int.TryParse(raw, out var sec) && sec > 0) return sec;
+        return DefaultIdleThresholdSec;
     }
 
     void OnLocked()
