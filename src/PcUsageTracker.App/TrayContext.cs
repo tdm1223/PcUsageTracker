@@ -298,10 +298,11 @@ internal sealed class TrayContext : ApplicationContext
 
             var sampleName = snap?.ProcessName;
             var effectiveName = sampleName is not null && _excluded.Contains(sampleName) ? null : sampleName;
-            if (isIdle) effectiveName = null;
+            if (isIdle) effectiveName = IdleSentinel.Name;
             _recorder.Tick(effectiveName, now);
 
             if (effectiveName is not null
+                && effectiveName != IdleSentinel.Name
                 && snap is { ExePath: { } path }
                 && !string.IsNullOrEmpty(path))
             {

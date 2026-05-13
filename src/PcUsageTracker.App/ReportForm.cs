@@ -9,6 +9,7 @@ internal sealed class ReportForm : Form
 {
     const int RefreshMs = 5000;
     const int IconColWidth = 24;
+    const string IdleDisplayName = "(Idle)";
 
     readonly Aggregator _agg;
     readonly IClock _clock;
@@ -192,10 +193,23 @@ internal sealed class ReportForm : Form
         foreach (var e in entries)
         {
             var pct = total > 0 ? (double)e.TotalSeconds / total * 100.0 : 0.0;
-            var icon = _iconCache.Get(e.ExePath);
-            var idx = grid.Rows.Add(icon, e.ProcessName, FormatDuration(e.TotalSeconds), $"{pct:0.0}%");
-            if (!string.IsNullOrEmpty(e.ExePath))
+            bool isIdle = string.Equals(e.ProcessName, IdleSentinel.Name, StringComparison.Ordinal);
+            var displayName = isIdle ? IdleDisplayName : e.ProcessName;
+            var icon = isIdle ? null : _iconCache.Get(e.ExePath);
+            var idx = grid.Rows.Add(icon, displayName, FormatDuration(e.TotalSeconds), $"{pct:0.0}%");
+            if (isIdle)
+            {
+                // Italic + 약한 회색으로 실제 프로세스 행과 구별 — '(Idle)'은 OS 프로세스가 아니라 입력 부재 시간.
+                grid.Rows[idx].Cells["Process"].Style = new DataGridViewCellStyle
+                {
+                    Font = new Font(grid.Font, FontStyle.Italic),
+                    ForeColor = SystemColors.GrayText,
+                };
+            }
+            else if (!string.IsNullOrEmpty(e.ExePath))
+            {
                 grid.Rows[idx].Cells["Process"].ToolTipText = e.ExePath;
+            }
         }
     }
 
@@ -209,6 +223,10 @@ internal sealed class ReportForm : Form
 
     void OnDeleteAndExclude(string processName)
     {
+        // idle sentinel은 OS 프로세스가 아니므로 추적 제외 의미 없음 — 그리드 표시값('(Idle)')이 넘어오면 조용히 무시.
+        if (string.Equals(processName, IdleDisplayName, StringComparison.Ordinal))
+            return;
+
         var msg = $"Delete all history for '{processName}' and stop tracking it from now on?\n\n" +
                   $"This cannot be undone.";
         var result = MessageBox.Show(this, msg, "Confirm delete & exclude",
