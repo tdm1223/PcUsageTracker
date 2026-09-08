@@ -104,6 +104,14 @@ public static class Migrations
         INSERT OR IGNORE INTO schema_version VALUES (6);
         """;
 
+    const string V7 = """
+        CREATE INDEX IF NOT EXISTS idx_sessions_open_heartbeat
+          ON sessions(last_seen_at)
+          WHERE end_at IS NULL;
+
+        INSERT OR IGNORE INTO schema_version VALUES (7);
+        """;
+
     /// <summary>v3 시드: Windows 시스템 UI 호스트 프로세스. 시작메뉴/검색/잠금 등 노이즈 차단.</summary>
     static readonly string[] DefaultSystemUiExclusions = new[]
     {
@@ -138,6 +146,15 @@ public static class Migrations
             cmd.ExecuteNonQuery();
         }
 
+        EnsureSessionHeartbeatColumn(conn, tx);
+
+        using (var cmd = conn.CreateCommand())
+        {
+            cmd.Transaction = tx;
+            cmd.CommandText = V7;
+            cmd.ExecuteNonQuery();
+        }
+
         NormalizeOtherCategory(conn, tx);
 
         using (var seedCmd = conn.CreateCommand())
@@ -157,6 +174,33 @@ public static class Migrations
         }
 
         tx.Commit();
+    }
+
+    static void EnsureSessionHeartbeatColumn(SqliteConnection conn, SqliteTransaction tx)
+    {
+        var exists = false;
+        using (var info = conn.CreateCommand())
+        {
+            info.Transaction = tx;
+            info.CommandText = "PRAGMA table_info(sessions);";
+            using var reader = info.ExecuteReader();
+            while (reader.Read())
+            {
+                if (!string.Equals(reader.GetString(1), "last_seen_at", StringComparison.OrdinalIgnoreCase))
+                    continue;
+                exists = true;
+                break;
+            }
+        }
+
+        if (!exists)
+            Execute("ALTER TABLE sessions ADD COLUMN last_seen_at INTEGER;", conn, tx);
+
+        Execute("""
+            UPDATE sessions
+            SET last_seen_at = COALESCE(last_seen_at, end_at, start_at)
+            WHERE last_seen_at IS NULL;
+            """, conn, tx);
     }
 
     /// <summary>

@@ -19,6 +19,11 @@ public class SessionRecorderTests
             return id;
         }
 
+        public void Touch(long sessionId, DateTimeOffset observedAt)
+        {
+            Events.Add(new Event("touch", sessionId, null, observedAt));
+        }
+
         public void Close(long sessionId, DateTimeOffset endAt)
         {
             Events.Add(new Event("close", sessionId, null, endAt));
@@ -52,6 +57,41 @@ public class SessionRecorderTests
 
         sink.Events.Should().HaveCount(1);
         sink.Events[0].Kind.Should().Be("open");
+    }
+
+    [Fact]
+    public void same_process_writes_a_bounded_heartbeat()
+    {
+        var sink = new FakeSink();
+        var r = new SessionRecorder(sink);
+
+        r.Tick("chrome", T(0));
+        r.Tick("chrome", T(4));
+        r.Tick("chrome", T(5));
+        r.Tick("chrome", T(9));
+        r.Tick("chrome", T(10));
+
+        sink.Events.Select(e => (e.Kind, e.At)).Should().Equal(
+            ("open", T(0)),
+            ("touch", T(5)),
+            ("touch", T(10)));
+    }
+
+    [Fact]
+    public void long_timer_gap_splits_at_last_observation_instead_of_counting_the_gap()
+    {
+        var sink = new FakeSink();
+        var r = new SessionRecorder(sink);
+
+        r.Tick("chrome", T(0));
+        r.Tick("chrome", T(5));
+        r.Tick("chrome", T(40));
+
+        sink.Events.Should().ContainInOrder(
+            new FakeSink.Event("open", 1, "chrome", T(0)),
+            new FakeSink.Event("touch", 1, null, T(5)),
+            new FakeSink.Event("close", 1, null, T(5)),
+            new FakeSink.Event("open", 2, "chrome", T(40)));
     }
 
     [Fact]

@@ -1,4 +1,6 @@
 using System.Runtime.InteropServices;
+using System.Security.Cryptography;
+using System.Text;
 using System.Threading.Channels;
 using Microsoft.Win32;
 using PcUsageTracker.App.Interop;
@@ -834,7 +836,7 @@ internal sealed class ReportForm : Form
         processStyle.ForeColor = isIdle ? SystemColors.GrayText : SystemColors.ControlText;
 
         var categoryStyle = row.Cells["Category"].Style;
-        if (entry.ColorRgb is { } rgb)
+        if (!isIdle && entry.ColorRgb is { } rgb)
         {
             var color = ColorFromRgb(rgb);
             categoryStyle.BackColor = color;
@@ -1134,13 +1136,18 @@ internal sealed class AsyncIconCache : IDisposable
     readonly Channel<IconRequest> _queue;
     readonly CancellationTokenSource _disposeCancellation = new();
     readonly Task[] _workers;
+    readonly string _diskCacheDirectory;
     int _disposed;
 
     public Image EmptyImage { get; } = SystemIcons.Application.ToBitmap();
     public event EventHandler<IconResolvedEventArgs>? IconResolved;
 
-    public AsyncIconCache()
+    public AsyncIconCache(string? diskCacheDirectory = null)
     {
+        _diskCacheDirectory = Path.GetFullPath(diskCacheDirectory ?? Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+            "PcUsageTracker",
+            "icons"));
         _queue = Channel.CreateBounded<IconRequest>(new BoundedChannelOptions(QueueCapacity)
         {
             SingleWriter = false,
@@ -1203,6 +1210,10 @@ internal sealed class AsyncIconCache : IDisposable
     {
         var resolvedPath = ResolveExecutablePath(request.ProcessName, request.RequestedPath);
         var image = resolvedPath is null ? null : TryExtractExecutableIcon(resolvedPath);
+        if (image is not null && resolvedPath is not null)
+            TryPersistIcon(request.ProcessName, image);
+        if (image is null && request.PreviousLookup.Image is null)
+            image = TryLoadPersistedIcon(request.ProcessName);
         if (image is null && request.PreviousLookup.Image is null)
             image = TryGetShellIcon(
                 resolvedPath ?? request.RequestedPath ?? $"{request.ProcessName}.exe",
@@ -1228,6 +1239,52 @@ internal sealed class AsyncIconCache : IDisposable
 
         IconResolved?.Invoke(this,
             new IconResolvedEventArgs(request.ProcessName, request.RequestedPath, lookup));
+    }
+
+    Image? TryLoadPersistedIcon(string processName)
+    {
+        try
+        {
+            var path = GetPersistedIconPath(processName);
+            if (!File.Exists(path)) return null;
+            using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+            using var source = Image.FromStream(stream);
+            return new Bitmap(source);
+        }
+        catch (Exception ex)
+        {
+            Log.Debug(ex, "Could not load persisted icon for {Name}", processName);
+            return null;
+        }
+    }
+
+    void TryPersistIcon(string processName, Image image)
+    {
+        string? temporaryPath = null;
+        try
+        {
+            Directory.CreateDirectory(_diskCacheDirectory);
+            var destination = GetPersistedIconPath(processName);
+            temporaryPath = destination + $".{Guid.NewGuid():N}.tmp";
+            image.Save(temporaryPath, System.Drawing.Imaging.ImageFormat.Png);
+            File.Move(temporaryPath, destination, overwrite: true);
+        }
+        catch (Exception ex)
+        {
+            Log.Debug(ex, "Could not persist icon for {Name}", processName);
+            if (temporaryPath is not null)
+            {
+                try { File.Delete(temporaryPath); }
+                catch { }
+            }
+        }
+    }
+
+    string GetPersistedIconPath(string processName)
+    {
+        var normalized = processName.Trim().ToUpperInvariant();
+        var hash = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(normalized)));
+        return Path.Combine(_diskCacheDirectory, $"{hash}.png");
     }
 
     static string? ResolveExecutablePath(string processName, string? storedPath)

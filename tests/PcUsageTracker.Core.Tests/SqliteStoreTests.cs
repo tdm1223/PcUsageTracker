@@ -119,13 +119,15 @@ public class SqliteStoreTests : IDisposable
     }
 
     [Fact]
-    public void recover_orphaned_closes_within_cap()
+    public void recover_orphaned_closes_at_last_heartbeat()
     {
         long id1, id2;
         using (var store = new SqliteStore(_tmp))
         {
             id1 = store.Open("chrome", T(0));
             id2 = store.Open("code", T(30));
+            store.Touch(id1, T(20));
+            store.Touch(id2, T(80));
             // Dispose 없이 종료 시뮬레이션: end_at NULL
         }
 
@@ -137,24 +139,25 @@ public class SqliteStoreTests : IDisposable
         cmd.CommandText = "SELECT id, end_at, duration_sec FROM sessions ORDER BY id;";
         using var r = cmd.ExecuteReader();
         r.Read(); r.GetInt64(0).Should().Be(id1);
-        r.GetInt64(1).Should().Be(T(100).ToUnixTimeSeconds());
-        r.GetInt32(2).Should().Be(100);
+        r.GetInt64(1).Should().Be(T(20).ToUnixTimeSeconds());
+        r.GetInt32(2).Should().Be(20);
         r.Read(); r.GetInt64(0).Should().Be(id2);
-        r.GetInt64(1).Should().Be(T(100).ToUnixTimeSeconds());
-        r.GetInt32(2).Should().Be(70);
+        r.GetInt64(1).Should().Be(T(80).ToUnixTimeSeconds());
+        r.GetInt32(2).Should().Be(50);
     }
 
     [Fact]
-    public void recover_orphaned_applies_24h_cap()
+    public void recover_orphaned_never_counts_time_after_last_heartbeat()
     {
         long id;
         using (var store = new SqliteStore(_tmp))
         {
             id = store.Open("chrome", T(0));
+            store.Touch(id, T(120));
         }
 
         using var reopened = new SqliteStore(_tmp);
-        // now = start+3일 → cap 86400초로 제한
+        // 사흘 뒤 재실행되어도 꺼져 있던 시간은 포함하지 않는다.
         reopened.RecoverOrphanedSessions(T(3 * 86400));
 
         using var cmd = reopened.Connection.CreateCommand();
@@ -162,8 +165,28 @@ public class SqliteStoreTests : IDisposable
         cmd.Parameters.AddWithValue("$id", id);
         using var r = cmd.ExecuteReader();
         r.Read().Should().BeTrue();
-        r.GetInt64(0).Should().Be(T(86400).ToUnixTimeSeconds());
-        r.GetInt32(1).Should().Be(86400);
+        r.GetInt64(0).Should().Be(T(120).ToUnixTimeSeconds());
+        r.GetInt32(1).Should().Be(120);
+    }
+
+    [Fact]
+    public void recover_orphaned_without_a_heartbeat_does_not_count_powered_off_time()
+    {
+        long id;
+        using (var store = new SqliteStore(_tmp))
+            id = store.Open("chrome", T(0));
+
+        using var reopened = new SqliteStore(_tmp);
+        reopened.RecoverOrphanedSessions(T(3 * 86400)).Should().Be(1);
+
+        using var cmd = reopened.Connection.CreateCommand();
+        cmd.CommandText = "SELECT end_at, duration_sec, last_seen_at FROM sessions WHERE id = $id;";
+        cmd.Parameters.AddWithValue("$id", id);
+        using var reader = cmd.ExecuteReader();
+        reader.Read().Should().BeTrue();
+        reader.GetInt64(0).Should().Be(T(0).ToUnixTimeSeconds());
+        reader.GetInt32(1).Should().Be(0);
+        reader.GetInt64(2).Should().Be(T(0).ToUnixTimeSeconds());
     }
 
     [Fact]
@@ -544,7 +567,7 @@ public class SqliteStoreTests : IDisposable
 
         // 스키마 최신 버전으로 올라감
         Migrations.ReadVersion(store.Connection).Should().Be(SqliteStore.CurrentSchemaVersion);
-        SqliteStore.CurrentSchemaVersion.Should().Be(6);
+        SqliteStore.CurrentSchemaVersion.Should().Be(7);
 
         // 기존 데이터 보존
         store.EnumerateSessions().Should().HaveCount(1);
@@ -598,6 +621,10 @@ public class SqliteStoreTests : IDisposable
         store.IsExcluded("LegacyApp").Should().BeTrue();
         store.GetSetting("idle_threshold_sec").Should().Be("600");
         store.ListCategories().Should().HaveCount(6);
+        using var heartbeat = store.Connection.CreateCommand();
+        heartbeat.CommandText = "SELECT last_seen_at FROM sessions WHERE process_name = 'code';";
+        Convert.ToInt64(heartbeat.ExecuteScalar()).Should().Be(1060,
+            "closed legacy sessions should migrate their last observation to end_at");
     }
 
     [Fact]
@@ -814,6 +841,32 @@ public class SqliteStoreTests : IDisposable
         idle.Should().Throw<ArgumentException>();
         var invalid = () => store.UpsertApplicationRule("code", null, null, 0x1000000, T(0));
         invalid.Should().Throw<ArgumentOutOfRangeException>();
+    }
+
+    [Fact]
+    public void bulk_category_assignment_is_atomic_and_preserves_other_customizations()
+    {
+        using var store = new SqliteStore(_tmp);
+        var meetings = store.CreateCategory("Meetings", 0x223344);
+        store.UpsertApplicationRule("zoom", "Team Zoom", null, 0xABCDEF, T(0));
+
+        store.SetApplicationCategories(new[] { "zoom", "teams", "ZOOM" }, meetings, T(10))
+            .Should().Be(2);
+
+        var zoom = store.GetApplicationRule("zoom");
+        zoom.Should().NotBeNull();
+        zoom!.Value.Alias.Should().Be("Team Zoom");
+        zoom.Value.ColorOverrideRgb.Should().Be(0xABCDEF);
+        zoom.Value.CategoryId.Should().Be(meetings);
+        store.GetApplicationRule("teams")!.Value.CategoryId.Should().Be(meetings);
+
+        store.SetApplicationCategories(new[] { "zoom", "teams" }, null, T(20));
+        var unassignedZoom = store.GetApplicationRule("zoom")!.Value;
+        unassignedZoom.Alias.Should().Be("Team Zoom");
+        unassignedZoom.ColorOverrideRgb.Should().Be(0xABCDEF);
+        unassignedZoom.CategoryId.Should().BeNull();
+        store.GetApplicationRule("teams").Should().BeNull(
+            "an otherwise empty rule should be removed when it becomes unassigned");
     }
 
     [Fact]

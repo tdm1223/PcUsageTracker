@@ -10,8 +10,7 @@ namespace PcUsageTracker.Core.Storage;
 /// </summary>
 public sealed class SqliteStore : ISessionSink, IDisposable
 {
-    public const int OrphanedCapSeconds = 86400; // 비정상 종료 후 복구 시 24시간 cap
-    public const int CurrentSchemaVersion = 6;
+    public const int CurrentSchemaVersion = 7;
 
     readonly SqliteConnection _conn;
     readonly string _dbPath;
@@ -47,7 +46,7 @@ public sealed class SqliteStore : ISessionSink, IDisposable
     {
         using var cmd = _conn.CreateCommand();
         cmd.CommandText = """
-            INSERT INTO sessions (process_name, start_at) VALUES ($p, $s);
+            INSERT INTO sessions (process_name, start_at, last_seen_at) VALUES ($p, $s, $s);
             SELECT last_insert_rowid();
             """;
         cmd.Parameters.AddWithValue("$p", processName);
@@ -56,13 +55,29 @@ public sealed class SqliteStore : ISessionSink, IDisposable
         return id;
     }
 
+    public void Touch(long sessionId, DateTimeOffset observedAt)
+    {
+        using var cmd = _conn.CreateCommand();
+        cmd.CommandText = """
+            UPDATE sessions
+            SET last_seen_at = MAX(start_at, $observed)
+            WHERE id = $id
+              AND end_at IS NULL
+              AND (last_seen_at IS NULL OR $observed > last_seen_at);
+            """;
+        cmd.Parameters.AddWithValue("$observed", observedAt.ToUnixTimeSeconds());
+        cmd.Parameters.AddWithValue("$id", sessionId);
+        cmd.ExecuteNonQuery();
+    }
+
     public void Close(long sessionId, DateTimeOffset endAt)
     {
         using var cmd = _conn.CreateCommand();
         cmd.CommandText = """
             UPDATE sessions
             SET end_at = $e,
-                duration_sec = CASE WHEN $e - start_at >= 0 THEN $e - start_at ELSE 0 END
+                duration_sec = CASE WHEN $e - start_at >= 0 THEN $e - start_at ELSE 0 END,
+                last_seen_at = MAX(start_at, $e)
             WHERE id = $id AND end_at IS NULL;
             """;
         cmd.Parameters.AddWithValue("$e", endAt.ToUnixTimeSeconds());
@@ -71,8 +86,8 @@ public sealed class SqliteStore : ISessionSink, IDisposable
     }
 
     /// <summary>
-    /// 앱 시작 시 호출. end_at IS NULL 레코드를 전부 강제 close.
-    /// end_at = min(now, start_at + OrphanedCapSeconds). duration = end_at - start_at.
+    /// 앱 시작 시 호출. end_at IS NULL 레코드를 마지막으로 실제 관찰된 시각에 close한다.
+    /// 현재 시각까지 늘리지 않으므로 종료·절전 중 시간이 마지막 앱에 붙지 않는다.
     /// 복구된 레코드 수 반환.
     /// </summary>
     public int RecoverOrphanedSessions(DateTimeOffset now)
@@ -80,12 +95,12 @@ public sealed class SqliteStore : ISessionSink, IDisposable
         using var cmd = _conn.CreateCommand();
         cmd.CommandText = """
             UPDATE sessions
-            SET end_at = MIN($now, start_at + $cap),
-                duration_sec = MIN($now, start_at + $cap) - start_at
+            SET end_at = MAX(start_at, MIN($now, COALESCE(last_seen_at, start_at))),
+                duration_sec = MAX(start_at, MIN($now, COALESCE(last_seen_at, start_at))) - start_at,
+                last_seen_at = MAX(start_at, MIN($now, COALESCE(last_seen_at, start_at)))
             WHERE end_at IS NULL;
             """;
         cmd.Parameters.AddWithValue("$now", now.ToUnixTimeSeconds());
-        cmd.Parameters.AddWithValue("$cap", OrphanedCapSeconds);
         return cmd.ExecuteNonQuery();
     }
 
@@ -357,7 +372,7 @@ public sealed class SqliteStore : ISessionSink, IDisposable
                 close.Transaction = transaction;
                 close.CommandText = """
                     UPDATE sessions
-                    SET end_at = $end, duration_sec = $duration
+                    SET end_at = $end, duration_sec = $duration, last_seen_at = MAX(start_at, $end)
                     WHERE id = $id AND end_at IS NULL;
                     """;
                 close.Parameters.AddWithValue("$end", closingEndUnix);
@@ -378,8 +393,8 @@ public sealed class SqliteStore : ISessionSink, IDisposable
             var duration = importedEndUnix - startUnix;
             if (duration < 0) duration = 0;
             cmd.CommandText = """
-                INSERT INTO sessions (process_name, start_at, end_at, duration_sec)
-                VALUES ($p, $s, $e, $d);
+                INSERT INTO sessions (process_name, start_at, end_at, duration_sec, last_seen_at)
+                VALUES ($p, $s, $e, $d, MAX($s, $e));
                 SELECT last_insert_rowid();
                 """;
             cmd.Parameters.AddWithValue("$p", processName);
@@ -390,7 +405,7 @@ public sealed class SqliteStore : ISessionSink, IDisposable
         else
         {
             cmd.CommandText = """
-                INSERT INTO sessions (process_name, start_at) VALUES ($p, $s);
+                INSERT INTO sessions (process_name, start_at, last_seen_at) VALUES ($p, $s, $s);
                 SELECT last_insert_rowid();
                 """;
             cmd.Parameters.AddWithValue("$p", processName);
@@ -563,6 +578,71 @@ public sealed class SqliteStore : ISessionSink, IDisposable
         cmd.Parameters.AddWithValue("$color", (object?)colorOverrideRgb ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$at", at.ToUnixTimeSeconds());
         cmd.ExecuteNonQuery();
+    }
+
+    /// <summary>
+    /// Applies one category to several process rules atomically while preserving aliases and
+    /// per-application color overrides. A null category means Other / unassigned.
+    /// </summary>
+    public int SetApplicationCategories(
+        IEnumerable<string> processNames,
+        long? categoryId,
+        DateTimeOffset at)
+    {
+        ArgumentNullException.ThrowIfNull(processNames);
+        var names = processNames
+            .Select(ValidateProcessName)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+        if (names.Any(name => string.Equals(name, IdleSentinel.Name, StringComparison.OrdinalIgnoreCase)))
+            throw new ArgumentException("The idle sentinel cannot have an application rule.", nameof(processNames));
+
+        using var transaction = _conn.BeginTransaction();
+        if (categoryId is { } selectedCategory)
+        {
+            using var category = _conn.CreateCommand();
+            category.Transaction = transaction;
+            category.CommandText = "SELECT 1 FROM categories WHERE id = $id;";
+            category.Parameters.AddWithValue("$id", selectedCategory);
+            if (category.ExecuteScalar() is null)
+                throw new ArgumentException("The selected category does not exist.", nameof(categoryId));
+        }
+
+        foreach (var name in names)
+        {
+            using var apply = _conn.CreateCommand();
+            apply.Transaction = transaction;
+            apply.CommandText = """
+                INSERT INTO application_rules
+                  (process_name, alias, category_id, color_override_rgb, updated_at)
+                VALUES ($name, NULL, $category, NULL, $at)
+                ON CONFLICT(process_name) DO UPDATE SET
+                  category_id = excluded.category_id,
+                  updated_at = excluded.updated_at;
+                """;
+            apply.Parameters.AddWithValue("$name", name);
+            apply.Parameters.AddWithValue("$category", (object?)categoryId ?? DBNull.Value);
+            apply.Parameters.AddWithValue("$at", at.ToUnixTimeSeconds());
+            apply.ExecuteNonQuery();
+
+            if (categoryId is null)
+            {
+                using var cleanup = _conn.CreateCommand();
+                cleanup.Transaction = transaction;
+                cleanup.CommandText = """
+                    DELETE FROM application_rules
+                    WHERE process_name = $name
+                      AND alias IS NULL
+                      AND category_id IS NULL
+                      AND color_override_rgb IS NULL;
+                    """;
+                cleanup.Parameters.AddWithValue("$name", name);
+                cleanup.ExecuteNonQuery();
+            }
+        }
+
+        transaction.Commit();
+        return names.Length;
     }
 
     public bool DeleteApplicationRule(string processName)

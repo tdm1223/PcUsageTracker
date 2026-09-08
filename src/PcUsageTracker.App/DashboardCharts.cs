@@ -54,7 +54,7 @@ internal sealed class TimelineControl : Control
         _summary = segments.Count == 0
             ? $"No activity recorded on {day:yyyy-MM-dd}."
             : $"{_segments.Count} visible timeline spans on {day:yyyy-MM-dd}, " +
-              $"totaling {FormatDuration(totalSeconds)}. Each colored segment represents an application.";
+              $"totaling {FormatDuration(totalSeconds)}. Applications are colored; idle spans are empty.";
         _hoveredIndex = -1;
         if (_segments.Count == 0) _focusedIndex = -1;
         else if (_focusedIndex >= _segments.Count) _focusedIndex = _segments.Count - 1;
@@ -295,8 +295,11 @@ internal sealed class TimelineControl : Control
                 (int)Math.Floor(item.Coordinates.StartFraction * RasterWidth), 0, RasterWidth - 1);
             var endExclusive = Math.Clamp(
                 (int)Math.Ceiling(item.Coordinates.EndFraction * RasterWidth), start + 1, RasterWidth);
-            brush.Color = ColorFromRgb(item.Segment.ColorRgb);
-            graphics.FillRectangle(brush, start, 0, endExclusive - start, 1);
+            if (!item.Segment.IsIdle)
+            {
+                brush.Color = ColorFromRgb(item.Segment.ColorRgb);
+                graphics.FillRectangle(brush, start, 0, endExclusive - start, 1);
+            }
             Array.Fill(_hitIndexes, index, start, endExclusive - start);
         }
     }
@@ -442,7 +445,7 @@ internal sealed class DailyUsageChartControl : Control
         var slot = plot.Width / (double)_points.Count;
         var gap = Math.Max(1d, Math.Min(5d * scale, slot * .25));
         using var activeBrush = new SolidBrush(ActiveColor);
-        using var idleBrush = new SolidBrush(IdleColor);
+        using var idlePen = new Pen(IdleColor) { DashStyle = System.Drawing.Drawing2D.DashStyle.Dot };
         for (var i = 0; i < _points.Count; i++)
         {
             var point = _points[i];
@@ -455,8 +458,9 @@ internal sealed class DailyUsageChartControl : Control
                 e.Graphics.FillRectangle(activeBrush,
                     (float)x, (float)(plot.Bottom - activeHeight), (float)width, (float)activeHeight);
             if (idleHeight > 0)
-                e.Graphics.FillRectangle(idleBrush,
-                    (float)x, (float)(plot.Bottom - activeHeight - idleHeight), (float)width, (float)idleHeight);
+                e.Graphics.DrawRectangle(idlePen,
+                    (float)x, (float)(plot.Bottom - activeHeight - idleHeight),
+                    (float)width, (float)Math.Max(1d, idleHeight));
 
             var showLabel = _points.Count <= 7 || i == 0 || i == _points.Count - 1 || i % 5 == 0;
             if (!showLabel) continue;
@@ -580,13 +584,13 @@ internal sealed class DailyUsageChartControl : Control
         var y = Math.Max(0, ClientSize.Height - (int)Math.Round(18 * scale));
         var swatch = Math.Max(8, (int)Math.Round(10 * scale));
         using var active = new SolidBrush(ActiveColor);
-        using var idle = new SolidBrush(IdleColor);
+        using var idle = new Pen(IdleColor) { DashStyle = System.Drawing.Drawing2D.DashStyle.Dot };
         graphics.FillRectangle(active, 8, y + 2, swatch, swatch);
         TextRenderer.DrawText(graphics, "Active", Font, new Point(11 + swatch, y), ForeColor,
             TextFormatFlags.NoPadding);
         var activeWidth = TextRenderer.MeasureText("Active", Font).Width;
         var idleX = 18 + swatch + activeWidth;
-        graphics.FillRectangle(idle, idleX, y + 2, swatch, swatch);
+        graphics.DrawRectangle(idle, idleX, y + 2, swatch, swatch);
         TextRenderer.DrawText(graphics, "Idle", Font, new Point(idleX + swatch + 3, y), ForeColor,
             TextFormatFlags.NoPadding);
     }

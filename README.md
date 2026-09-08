@@ -23,12 +23,12 @@ Uninstall: Quit from tray, delete the exe, and optionally remove `%APPDATA%\PcUs
 
 ### Report window
 
-- **Dashboard tab** — choose any recorded date, jump one day backward/forward, or return to Today. It shows tracked/active/idle totals, the top application, a color-coded 24-hour timeline, selectable 7-day or 30-day active/idle bars, and the selected day's applications.
+- **Dashboard tab** — choose any recorded date, jump one day backward/forward, or return to Today. It shows tracked/active/idle totals, the top application, a color-coded 24-hour timeline (idle spans are left empty), selectable 7-day or 30-day active/idle bars, and the selected day's applications.
 - **Today + Week + Month tab** — all recorded processes for today, this week (Monday start), and this month.
 - **All-time tab** — cumulative usage for every recorded process.
 - Today's visible report refreshes every 5 seconds and preserves selected rows. Reporting uses an independent read-only SQLite connection in the background, so collection stays responsive; timer ticks coalesce behind an in-progress query instead of repeatedly canceling it. A historical Dashboard date stays cached instead of repeatedly querying unchanged data, and Import/application-rule changes invalidate that cache even while the report is hidden.
 - Each row shows the executable's icon, customizable display name and category color, duration, and share.
-- Missing or outdated executable paths are re-detected from running processes, Windows app registrations, and versioned install folders; unresolved entries use a neutral fallback instead of a broken-image X.
+- Missing or outdated executable paths are re-detected from running processes, Windows app registrations, and versioned install folders. Once successfully extracted, icons are also retained under `%APPDATA%\PcUsageTracker\icons\`, so an uninstalled or deleted executable can keep its last known image; unresolved entries use a neutral fallback instead of a broken-image X.
 - Hovering the process name shows the full exe path.
 - **Double-click a row** to open the folder containing that program.
 - **Right-click any row → "Edit application..."** to set an alias, category, or per-application color. The original process name remains the identity used by tracking and deletion.
@@ -40,7 +40,7 @@ Uninstall: Quit from tray, delete the exe, and optionally remove `%APPDATA%\PcUs
 
 Open **Applications & categories...** from the tray menu to manage presentation rules for every application found in history or executable metadata. The seeded categories are Coding, Game, Communication, Browsing, System, and Other; categories can be edited and additional categories can be created. **Other** is the permanent fallback for unassigned applications, so its color and order can be edited but it cannot be renamed or deleted.
 
-Aliases and category assignments are joined to reports dynamically. Changing a rule updates both historical and future usage displays without rewriting the underlying sessions. Pending application edits are saved automatically when selection changes, category definitions change, or the editor closes. `__idle__` is reserved (case-insensitive), always shown as `(Idle)` in gray, and cannot be edited.
+Aliases and category assignments are joined to reports dynamically. Changing a rule updates both historical and future usage displays without rewriting the underlying sessions. Choosing a category saves immediately; with several applications selected using Ctrl-click or Shift-click, the category is applied to all of them atomically. Other pending application edits are saved automatically when selection changes, category definitions change, or the editor closes. `__idle__` is reserved (case-insensitive), shown as an empty chart span, and cannot be edited.
 
 ### Excluded processes
 
@@ -60,10 +60,11 @@ Excluded processes never get recorded. Add more via the report window's right-cl
 
 - `%APPDATA%\PcUsageTracker\history.db` — SQLite (WAL).
 - `%APPDATA%\PcUsageTracker\logs\` — rolling daily logs.
+- `%APPDATA%\PcUsageTracker\icons\` — persistent last-known application icons.
 - `%APPDATA%\PcUsageTracker\updates\` — temporary verified update downloads and startup markers. Stale staging files are cleaned automatically.
 - Retention: unlimited. Open the DB with any SQLite viewer (DB Browser for SQLite, VS Code SQLite extension, etc.).
 
-### Schema (v6)
+### Schema (v7)
 
 ```sql
 CREATE TABLE sessions (
@@ -71,7 +72,8 @@ CREATE TABLE sessions (
   process_name  TEXT    NOT NULL,
   start_at      INTEGER NOT NULL,  -- unix epoch seconds
   end_at        INTEGER,           -- NULL while open
-  duration_sec  INTEGER
+  duration_sec  INTEGER,
+  last_seen_at  INTEGER            -- last persisted heartbeat while open
 );
 
 -- UI metadata: exe path → icon extraction for the report window
@@ -117,14 +119,19 @@ CREATE INDEX idx_sessions_import_logical
   ON sessions(process_name COLLATE NOCASE, start_at);
 CREATE INDEX idx_processes_name_nocase_seen
   ON processes(name COLLATE NOCASE, last_seen_at DESC);
+
+-- v7 crash-recovery heartbeat index
+CREATE INDEX idx_sessions_open_heartbeat
+  ON sessions(last_seen_at) WHERE end_at IS NULL;
 ```
 
-Migrations are transactional and idempotent. Existing v1-v5 DBs are auto-upgraded on first launch without rewriting session history.
+Migrations are transactional and idempotent. Existing v1-v6 DBs are auto-upgraded on first launch without rewriting session history.
 
 ## Behavior
 
 - Samples the foreground process once per second.
-- A row is written on process switch (close previous, open new).
+- A row is opened on process switch and its last-observed heartbeat is persisted every five seconds.
+- If timer delivery stops for more than 30 seconds (for example, a missed suspend notification), the active session is split at the last real sample so the gap is not counted.
 - Reporting clips sessions to the requested local calendar day and splits multi-day sessions at
   time-zone-aware midnight boundaries. Day totals therefore remain correct on 23-hour and
   25-hour daylight-saving transition days; open sessions are counted only through the current time.
@@ -139,7 +146,7 @@ Migrations are transactional and idempotent. Existing v1-v5 DBs are auto-upgrade
   before import and immediately observes the foreground application again afterward.
 - Screen lock (`Win+L`) pauses recording. Unlock resumes on next tick.
 - System suspend / resume pauses and resumes similarly.
-- On abnormal exit, any `end_at IS NULL` row is force-closed on next startup (capped at 24 hours from `start_at`).
+- On abnormal exit, any `end_at IS NULL` row is closed at its persisted `last_seen_at` on next startup. Powered-off time is therefore not attributed to the last foreground application.
 
 ## Build from source
 
@@ -149,7 +156,7 @@ Requires .NET 8 SDK.
 dotnet test
 dotnet publish src/PcUsageTracker.App -c Release -r win-x64 --self-contained true \
     -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true \
-    -p:Version=0.2.0 -o publish
+    -p:Version=1.0.0 -o publish
 ```
 
 Output: `publish/PcUsageTracker.App.exe` (~157 MB, self-contained — includes the .NET 8 WindowsDesktop runtime).
@@ -157,10 +164,10 @@ Output: `publish/PcUsageTracker.App.exe` (~157 MB, self-contained — includes t
 If size matters, build as framework-dependent instead:
 ```
 dotnet publish src/PcUsageTracker.App -c Release -r win-x64 --self-contained false \
-    -p:PublishSingleFile=true -p:Version=0.2.0 -o publish-fd
+    -p:PublishSingleFile=true -p:Version=1.0.0 -o publish-fd
 ```
 That produces a ~2 MB exe but requires the .NET 8 Desktop Runtime on the target machine.
-Replace `0.2.0` with the version being built. The source default is `0.2.0` for ordinary development builds, while the release workflow always overrides it from the exact `vMAJOR.MINOR.PATCH` tag.
+Replace `1.0.0` with the version being built. The source default is `1.0.0` for ordinary development builds, while the release workflow always overrides it from the exact `vMAJOR.MINOR.PATCH` tag.
 
 ### Inspecting the DB
 

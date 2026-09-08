@@ -30,6 +30,7 @@ internal sealed class ApplicationRulesForm : Form
     public ApplicationRulesForm(SqliteStore store, string? initialProcessName = null)
     {
         _store = store;
+        _applicationsGrid.MultiSelect = true;
         Text = "Applications & categories";
         StartPosition = FormStartPosition.CenterParent;
         Size = new Size(920, 640);
@@ -57,6 +58,7 @@ internal sealed class ApplicationRulesForm : Form
             if (e.RowIndex >= 0) _aliasText.Focus();
         };
         _useCustomColor.CheckedChanged += (_, _) => _colorButton.Enabled = _useCustomColor.Checked;
+        _categoryCombo.SelectionChangeCommitted += (_, _) => SaveCategoryImmediately();
         _colorButton.Click += (_, _) => ChooseColor(_colorButton, ref _selectedColor);
         _saveRuleButton.Click += (_, _) => SaveSelectedRule();
         _clearRuleButton.Click += (_, _) => ClearSelectedRule();
@@ -114,16 +116,17 @@ internal sealed class ApplicationRulesForm : Form
         actions.Controls.Add(_clearRuleButton);
         actions.Controls.Add(new Label
         {
-            Text = "Unsaved edits are saved automatically when you switch applications or close this window.",
+            Text = "Category choices save immediately. Ctrl/Shift selects multiple rows and applies to all.",
             AutoSize = true,
             ForeColor = SystemColors.GrayText,
             Margin = new Padding(8, 7, 0, 0),
         });
-        editor.Controls.Add(actions, 3, 2);
+        editor.Controls.Add(actions, 2, 2);
+        editor.SetColumnSpan(actions, 2);
 
         var layout = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 2 };
         layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
-        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 125));
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 145));
         layout.Controls.Add(_applicationsGrid, 0, 0);
         layout.Controls.Add(editor, 0, 1);
         page.Controls.Add(layout);
@@ -208,8 +211,14 @@ internal sealed class ApplicationRulesForm : Form
         }
     }
 
-    void ReloadApplications(string? selectProcess)
+    void ReloadApplications(string? selectProcess) => ReloadApplications(
+        selectProcess is null ? null : new[] { selectProcess });
+
+    void ReloadApplications(IReadOnlyCollection<string>? selectProcesses)
     {
+        var wanted = selectProcesses is null
+            ? null
+            : new HashSet<string>(selectProcesses, StringComparer.OrdinalIgnoreCase);
         _applicationsGrid.Rows.Clear();
         foreach (var app in _store.ListKnownApplications())
         {
@@ -221,13 +230,15 @@ internal sealed class ApplicationRulesForm : Form
         }
 
         _applicationsGrid.ClearSelection();
-        var selected = _applicationsGrid.Rows.Cast<DataGridViewRow>()
-            .FirstOrDefault(row => row.Tag is KnownApplication app &&
-                                   string.Equals(app.ProcessName, selectProcess, StringComparison.OrdinalIgnoreCase));
-        if (selected is not null)
+        var selected = wanted is null
+            ? []
+            : _applicationsGrid.Rows.Cast<DataGridViewRow>()
+                .Where(row => row.Tag is KnownApplication app && wanted.Contains(app.ProcessName))
+                .ToArray();
+        if (selected.Length > 0)
         {
-            selected.Selected = true;
-            _applicationsGrid.CurrentCell = selected.Cells[0];
+            _applicationsGrid.CurrentCell = selected[0].Cells[0];
+            foreach (var row in selected) row.Selected = true;
         }
         else if (_applicationsGrid.Rows.Count > 0)
         {
@@ -239,16 +250,31 @@ internal sealed class ApplicationRulesForm : Form
     void LoadSelectedApplication()
     {
         if (_loading) return;
-        var app = _applicationsGrid.SelectedRows.Count > 0
-            ? _applicationsGrid.SelectedRows[0].Tag as KnownApplication?
-            : null;
+        var selected = _applicationsGrid.SelectedRows.Cast<DataGridViewRow>()
+            .Select(row => row.Tag)
+            .OfType<KnownApplication>()
+            .ToArray();
+        var app = selected.Length == 1 ? selected[0] : (KnownApplication?)null;
         _selectedProcessName = app?.ProcessName;
         var enabled = app is not null;
         _aliasText.Enabled = enabled;
-        _categoryCombo.Enabled = enabled;
+        _categoryCombo.Enabled = enabled || selected.Length > 1;
         _useCustomColor.Enabled = enabled;
         _saveRuleButton.Enabled = enabled;
         _clearRuleButton.Enabled = enabled;
+
+        if (selected.Length > 1)
+        {
+            _selectedProcessLabel.Text = $"{selected.Length} applications selected";
+            _aliasText.Text = string.Empty;
+            _categoryCombo.SelectedIndex = -1;
+            _useCustomColor.Checked = false;
+            _colorButton.Enabled = false;
+            _loadedAlias = null;
+            _loadedCategoryId = null;
+            _loadedColorOverrideRgb = null;
+            return;
+        }
 
         if (app is null)
         {
@@ -278,21 +304,16 @@ internal sealed class ApplicationRulesForm : Form
     void OnApplicationSelectionChanged()
     {
         if (_loading) return;
-        var nextProcess = _applicationsGrid.SelectedRows.Count > 0 &&
-                          _applicationsGrid.SelectedRows[0].Tag is KnownApplication next
-            ? next.ProcessName
-            : null;
-        var selectionChanged =
+        var selected = _applicationsGrid.SelectedRows.Cast<DataGridViewRow>()
+            .Select(row => row.Tag)
+            .OfType<KnownApplication>()
+            .ToArray();
+        var nextProcess = selected.Length == 1 ? selected[0].ProcessName : null;
+        var selectionChanged = selected.Length != 1 ||
             !string.Equals(nextProcess, _selectedProcessName, StringComparison.OrdinalIgnoreCase);
-        var savedAndReloaded = selectionChanged && HasUnsavedRuleChanges();
-        if (selectionChanged && !TrySavePendingRule(nextProcess))
+        if (selectionChanged && !TrySavePendingRule(reloadApplications: false))
         {
             RestoreApplicationSelection(_selectedProcessName);
-            return;
-        }
-        if (savedAndReloaded)
-        {
-            // Auto-save reloaded and re-sorted the list while preserving the row the user intended.
             return;
         }
         LoadSelectedApplication();
@@ -312,6 +333,10 @@ internal sealed class ApplicationRulesForm : Form
                 try { ReloadApplications(selection); }
                 finally { _loading = false; }
                 LoadSelectedApplication();
+            }
+            else
+            {
+                RefreshApplicationRow(_selectedProcessName);
             }
             return true;
         }
@@ -349,6 +374,39 @@ internal sealed class ApplicationRulesForm : Form
         _loadedAlias = NormalizeAlias(_aliasText.Text);
         _loadedCategoryId = (_categoryCombo.SelectedItem as CategoryChoice)?.Id;
         _loadedColorOverrideRgb = _useCustomColor.Checked ? _selectedColor : null;
+    }
+
+    void RefreshApplicationRow(string processName)
+    {
+        _loading = true;
+        try
+        {
+            var updated = _store.ListKnownApplications().FirstOrDefault(app =>
+                string.Equals(app.ProcessName, processName, StringComparison.OrdinalIgnoreCase));
+            var row = _applicationsGrid.Rows.Cast<DataGridViewRow>().FirstOrDefault(candidate =>
+                candidate.Tag is KnownApplication app &&
+                string.Equals(app.ProcessName, processName, StringComparison.OrdinalIgnoreCase));
+            if (row is null) return;
+            if (string.IsNullOrEmpty(updated.ProcessName))
+            {
+                _applicationsGrid.Rows.Remove(row);
+                return;
+            }
+
+            row.Tag = updated;
+            row.Cells["Process"].Value = updated.ProcessName;
+            row.Cells["Alias"].Value = updated.DisplayName;
+            row.Cells["Category"].Value = updated.CategoryName;
+            row.Cells["Color"].Value = ToHex(updated.ResolvedColorRgb);
+            row.Cells["Path"].Value = updated.ExePath ?? string.Empty;
+            ApplyColorCell(row.Cells["Color"], updated.ResolvedColorRgb);
+            _applicationsGrid.Sort(_applicationsGrid.Columns["Alias"],
+                System.ComponentModel.ListSortDirection.Ascending);
+        }
+        finally
+        {
+            _loading = false;
+        }
     }
 
     void RestoreApplicationSelection(string? processName)
@@ -413,6 +471,50 @@ internal sealed class ApplicationRulesForm : Form
         {
             ShowError("Could not clear the application rule.", ex);
         }
+    }
+
+    void ApplyCategoryToSelection()
+    {
+        var processNames = _applicationsGrid.SelectedRows.Cast<DataGridViewRow>()
+            .Select(row => row.Tag)
+            .OfType<KnownApplication>()
+            .Select(app => app.ProcessName)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+        if (processNames.Length < 2) return;
+        if (_categoryCombo.SelectedItem is not CategoryChoice category)
+        {
+            MessageBox.Show(this, "Choose a category to apply to the selected applications.",
+                "Bulk category", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            _categoryCombo.DroppedDown = true;
+            return;
+        }
+
+        try
+        {
+            _store.SetApplicationCategories(processNames, category.Id, DateTimeOffset.UtcNow);
+            _loading = true;
+            try { ReloadApplications(processNames); }
+            finally { _loading = false; }
+            LoadSelectedApplication();
+        }
+        catch (Exception ex)
+        {
+            ShowError("Could not update the selected application categories.", ex);
+        }
+    }
+
+    void SaveCategoryImmediately()
+    {
+        if (_loading || _categoryCombo.SelectedItem is not CategoryChoice) return;
+        if (_applicationsGrid.SelectedRows.Count > 1)
+        {
+            ApplyCategoryToSelection();
+            return;
+        }
+
+        if (_selectedProcessName is not null)
+            TrySavePendingRule();
     }
 
     void AddCategory()

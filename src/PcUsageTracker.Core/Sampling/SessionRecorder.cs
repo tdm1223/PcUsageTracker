@@ -7,8 +7,13 @@ namespace PcUsageTracker.Core.Sampling;
 /// </summary>
 public sealed class SessionRecorder
 {
+    public static readonly TimeSpan HeartbeatInterval = TimeSpan.FromSeconds(5);
+    public static readonly TimeSpan ContinuityGapThreshold = TimeSpan.FromSeconds(30);
+
     readonly ISessionSink _sink;
     (long Id, string ProcessName)? _current;
+    DateTimeOffset? _lastHeartbeatAt;
+    DateTimeOffset? _lastObservedAt;
     bool _paused;
 
     public SessionRecorder(ISessionSink sink)
@@ -24,6 +29,14 @@ public sealed class SessionRecorder
     {
         if (_paused) return;
 
+        // Suspend/shutdown notifications are best-effort. If timer delivery itself stopped for a
+        // long interval, split the session at the last real sample instead of counting the gap.
+        if (_current is not null && _lastObservedAt is { } lastObserved &&
+            now - lastObserved > ContinuityGapThreshold)
+        {
+            CloseCurrent(lastObserved);
+        }
+
         if (processName is null)
         {
             CloseCurrent(now);
@@ -34,6 +47,8 @@ public sealed class SessionRecorder
         {
             var id = _sink.Open(processName, now);
             _current = (id, processName);
+            _lastHeartbeatAt = now;
+            _lastObservedAt = now;
             return;
         }
 
@@ -42,14 +57,29 @@ public sealed class SessionRecorder
             _sink.Close(_current.Value.Id, now);
             var id = _sink.Open(processName, now);
             _current = (id, processName);
+            _lastHeartbeatAt = now;
+            _lastObservedAt = now;
+            return;
         }
-        // 같은 프로세스는 no-op (end_at 업데이트는 세션 종료 시 한 번).
+
+        // 비정상 종료 시 PC가 꺼진 시간을 마지막 앱에 붙이지 않도록 마지막 관찰 시각을
+        // 주기적으로 영속화한다. 매초 쓰지 않고 5초 단위로 제한한다.
+        if (_lastHeartbeatAt is null || now - _lastHeartbeatAt.Value >= HeartbeatInterval)
+        {
+            _sink.Touch(_current.Value.Id, now);
+            _lastHeartbeatAt = now;
+        }
+        _lastObservedAt = now;
     }
 
     public void Pause(DateTimeOffset at)
     {
         if (_paused) return;
-        CloseCurrent(at);
+        var closeAt = _lastObservedAt is { } lastObserved &&
+                      at - lastObserved > ContinuityGapThreshold
+            ? lastObserved
+            : at;
+        CloseCurrent(closeAt);
         _paused = true;
     }
 
@@ -64,6 +94,8 @@ public sealed class SessionRecorder
         {
             _sink.Close(c.Id, at);
             _current = null;
+            _lastHeartbeatAt = null;
+            _lastObservedAt = null;
         }
     }
 }
