@@ -65,7 +65,7 @@ internal sealed class Win32ForegroundProbe : IForegroundProbe
     /// QueryFullProcessImageName으로 exe 경로를 조회. 실패 시 null.
     /// MainModule 기반 조회와 달리 elevated/protected 프로세스에도 대부분 작동한다.
     /// </summary>
-    static string? TryGetExePath(uint pid)
+    internal static string? TryGetExePath(uint pid)
     {
         var handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid);
         if (handle == IntPtr.Zero) return null;

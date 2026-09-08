@@ -23,9 +23,11 @@ Uninstall: Quit from tray, delete the exe, and optionally remove `%APPDATA%\PcUs
 
 - **Today + Week tab** — top 5 processes for today and this week (Monday start).
 - **All-time top 20 tab** — cumulative top 20.
-- Refreshes every 5 seconds while open.
+- Refreshes every 5 seconds while open and preserves selected rows.
 - Each row shows the executable's icon (extracted from the exe file), the process name, duration, and a proportional bar.
+- Missing or outdated executable paths are re-detected from running processes, Windows app registrations, and versioned install folders; unresolved entries use a neutral fallback instead of a broken-image X.
 - Hovering the process name shows the full exe path.
+- **Double-click a row** to open the folder containing that program.
 - **Right-click any row → "Delete history & stop tracking"** to remove all past sessions for that process and prevent it from being recorded again. Confirmation prompt is shown.
 
 ### Excluded processes
