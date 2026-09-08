@@ -18,12 +18,15 @@ internal sealed class ReportForm : Form
     readonly IClock _clock;
     readonly SqliteStore _store;
     readonly Action _onExclusionChanged;
+    readonly TabControl _tabs;
     readonly DataGridView _todayGrid;
     readonly DataGridView _weekGrid;
     readonly DataGridView _monthGrid;
     readonly DataGridView _allGrid;
     readonly System.Windows.Forms.Timer _refresh;
     readonly IconCache _iconCache = new();
+    readonly Font _idleFont;
+    bool _isResizing;
 
     public ReportForm(Aggregator agg, IClock clock, SqliteStore store, Action onExclusionChanged)
     {
@@ -36,8 +39,10 @@ internal sealed class ReportForm : Form
         Size = new Size(880, 520);
         StartPosition = FormStartPosition.CenterScreen;
         MinimumSize = new Size(640, 400);
+        DoubleBuffered = true;
+        _idleFont = new Font(Font, FontStyle.Italic);
 
-        var tabs = new TabControl { Dock = DockStyle.Fill };
+        _tabs = new TabControl { Dock = DockStyle.Fill };
 
         var tab1 = new TabPage("Today + Week + Month");
         var split = new TableLayoutPanel
@@ -62,13 +67,29 @@ internal sealed class ReportForm : Form
         _allGrid = BuildGrid(this);
         tab2.Controls.Add(WrapWithHeader("All-time", _allGrid));
 
-        tabs.TabPages.Add(tab1);
-        tabs.TabPages.Add(tab2);
-        Controls.Add(tabs);
+        _tabs.TabPages.Add(tab1);
+        _tabs.TabPages.Add(tab2);
+        Controls.Add(_tabs);
 
         _refresh = new System.Windows.Forms.Timer { Interval = RefreshMs };
-        _refresh.Tick += (_, _) => ReloadAll();
-        Shown += (_, _) => { ReloadAll(); _refresh.Start(); };
+        _refresh.Tick += (_, _) => ReloadVisibleTab();
+        _tabs.SelectedIndexChanged += (_, _) =>
+        {
+            if (Visible && !_isResizing) ReloadVisibleTab();
+        };
+        ResizeBegin += (_, _) =>
+        {
+            _isResizing = true;
+            _refresh.Stop();
+        };
+        ResizeEnd += (_, _) =>
+        {
+            _isResizing = false;
+            if (!Visible) return;
+            ReloadVisibleTab();
+            _refresh.Start();
+        };
+        Shown += (_, _) => { ReloadVisibleTab(); _refresh.Start(); };
         FormClosing += (s, e) =>
         {
             // 트레이 상주 앱 — 닫기 버튼은 숨기기로만
@@ -83,7 +104,7 @@ internal sealed class ReportForm : Form
 
     static DataGridView BuildGrid(ReportForm owner)
     {
-        var g = new DataGridView
+        var g = new BufferedDataGridView
         {
             Dock = DockStyle.Fill,
             ReadOnly = true,
@@ -93,6 +114,8 @@ internal sealed class ReportForm : Form
             RowHeadersVisible = false,
             SelectionMode = DataGridViewSelectionMode.FullRowSelect,
             AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.Fill,
+            AutoSizeRowsMode = DataGridViewAutoSizeRowsMode.None,
+            ColumnHeadersHeightSizeMode = DataGridViewColumnHeadersHeightSizeMode.DisableResizing,
             BackgroundColor = SystemColors.Window,
             BorderStyle = BorderStyle.Fixed3D,
             RowTemplate = { Height = 22 },
@@ -178,9 +201,15 @@ internal sealed class ReportForm : Form
         return panel;
     }
 
-    void ReloadAll()
+    void ReloadVisibleTab()
     {
         var now = _clock.UtcNow;
+        if (_tabs.SelectedIndex == 1)
+        {
+            Populate(_allGrid, _agg.AllTime(now));
+            return;
+        }
+
         var (todayFrom, todayTo) = Aggregator.TodayRange(now);
         var (weekFrom, weekTo) = Aggregator.ThisWeekRange(now);
         var (monthFrom, monthTo) = Aggregator.ThisMonthRange(now);
@@ -188,65 +217,105 @@ internal sealed class ReportForm : Form
         Populate(_todayGrid, _agg.TopN(todayFrom, todayTo, now));
         Populate(_weekGrid, _agg.TopN(weekFrom, weekTo, now));
         Populate(_monthGrid, _agg.TopN(monthFrom, monthTo, now));
-        Populate(_allGrid, _agg.AllTime(now));
     }
 
-    public void RequestReload() => ReloadAll();
+    public void RequestReload() => ReloadVisibleTab();
 
     void Populate(DataGridView grid, IReadOnlyList<ReportEntry> entries)
     {
-        var selectedProcesses = grid.SelectedRows
-            .Cast<DataGridViewRow>()
-            .Select(GetProcessName)
-            .Where(name => name is not null)
-            .ToHashSet(StringComparer.Ordinal);
+        var rebuildRows = !RowsMatchEntries(grid, entries);
+        var selectedProcesses = rebuildRows
+            ? grid.SelectedRows
+                .Cast<DataGridViewRow>()
+                .Select(GetProcessName)
+                .Where(name => name is not null)
+                .ToHashSet(StringComparer.Ordinal)
+            : null;
+        var firstDisplayedProcess = rebuildRows && grid.FirstDisplayedScrollingRowIndex >= 0
+            ? GetProcessName(grid.Rows[grid.FirstDisplayedScrollingRowIndex])
+            : null;
 
         grid.SuspendLayout();
         try
         {
-            grid.Rows.Clear();
-            if (entries.Count == 0) return;
-
             long total = entries.Sum(r => (long)r.TotalSeconds);
-            foreach (var e in entries)
+            if (rebuildRows)
             {
-                var pct = total > 0 ? (double)e.TotalSeconds / total * 100.0 : 0.0;
-                bool isIdle = string.Equals(e.ProcessName, IdleSentinel.Name, StringComparison.Ordinal);
-                var displayName = isIdle ? IdleDisplayName : e.ProcessName;
-                var iconLookup = isIdle ? default : _iconCache.Get(e.ProcessName, e.ExePath);
-                var rowEntry = iconLookup.ResolvedPath is { } resolvedPath
-                    ? e with { ExePath = resolvedPath }
-                    : e;
-                if (!string.Equals(e.ExePath, rowEntry.ExePath, StringComparison.OrdinalIgnoreCase))
-                    RepairStoredPath(e.ProcessName, rowEntry.ExePath!);
-
-                var icon = iconLookup.Image ?? _iconCache.EmptyImage;
-                var idx = grid.Rows.Add(icon, displayName, FormatDuration(e.TotalSeconds), $"{pct:0.0}%");
-                var row = grid.Rows[idx];
-                row.Tag = rowEntry;
-                if (isIdle)
-                {
-                    // Italic + 약한 회색으로 실제 프로세스 행과 구별 — '(Idle)'은 OS 프로세스가 아니라 입력 부재 시간.
-                    row.Cells["Process"].Style = new DataGridViewCellStyle
-                    {
-                        Font = new Font(grid.Font, FontStyle.Italic),
-                        ForeColor = SystemColors.GrayText,
-                    };
-                }
-                else if (!string.IsNullOrEmpty(rowEntry.ExePath))
-                {
-                    row.Cells["Process"].ToolTipText = rowEntry.ExePath;
-                }
+                grid.Rows.Clear();
+                foreach (var entry in entries)
+                    grid.Rows.Add();
             }
+
+            for (var index = 0; index < entries.Count; index++)
+                UpdateRow(grid.Rows[index], entries[index], total);
+
+            if (!rebuildRows) return;
 
             grid.ClearSelection();
             foreach (DataGridViewRow row in grid.Rows)
-                row.Selected = selectedProcesses.Contains(GetProcessName(row));
+                row.Selected = selectedProcesses!.Contains(GetProcessName(row));
+
+            if (firstDisplayedProcess is not null)
+            {
+                var scrollRow = grid.Rows.Cast<DataGridViewRow>()
+                    .FirstOrDefault(row => string.Equals(
+                        GetProcessName(row), firstDisplayedProcess, StringComparison.Ordinal));
+                if (scrollRow is not null) grid.FirstDisplayedScrollingRowIndex = scrollRow.Index;
+            }
         }
         finally
         {
             grid.ResumeLayout();
         }
+    }
+
+    static bool RowsMatchEntries(DataGridView grid, IReadOnlyList<ReportEntry> entries)
+    {
+        if (grid.Rows.Count != entries.Count) return false;
+        for (var index = 0; index < entries.Count; index++)
+        {
+            if (!string.Equals(GetProcessName(grid.Rows[index]), entries[index].ProcessName,
+                    StringComparison.Ordinal))
+                return false;
+        }
+        return true;
+    }
+
+    void UpdateRow(DataGridViewRow row, ReportEntry entry, long total)
+    {
+        var isIdle = string.Equals(entry.ProcessName, IdleSentinel.Name, StringComparison.Ordinal);
+        var iconLookup = isIdle ? default : _iconCache.Get(entry.ProcessName, entry.ExePath);
+        var rowEntry = iconLookup.ResolvedPath is { } resolvedPath
+            ? entry with { ExePath = resolvedPath }
+            : entry;
+        if (!string.Equals(entry.ExePath, rowEntry.ExePath, StringComparison.OrdinalIgnoreCase))
+            RepairStoredPath(entry.ProcessName, rowEntry.ExePath!);
+
+        SetCellValue(row.Cells["Icon"], iconLookup.Image ?? _iconCache.EmptyImage);
+        SetCellValue(row.Cells["Process"], isIdle ? IdleDisplayName : entry.ProcessName);
+        SetCellValue(row.Cells["Duration"], FormatDuration(entry.TotalSeconds));
+        var pct = total > 0 ? (double)entry.TotalSeconds / total * 100.0 : 0.0;
+        SetCellValue(row.Cells["Share"], $"{pct:0.0}%");
+        row.Tag = rowEntry;
+
+        if (isIdle && row.Cells["Process"].Style.Font is null)
+        {
+            // '(Idle)'은 OS 프로세스가 아니라 입력 부재 시간이므로 실제 프로세스와 시각적으로 구별한다.
+            row.Cells["Process"].Style = new DataGridViewCellStyle
+            {
+                Font = _idleFont,
+                ForeColor = SystemColors.GrayText,
+            };
+        }
+
+        var tooltip = isIdle ? string.Empty : rowEntry.ExePath ?? string.Empty;
+        if (!string.Equals(row.Cells["Process"].ToolTipText, tooltip, StringComparison.Ordinal))
+            row.Cells["Process"].ToolTipText = tooltip;
+    }
+
+    static void SetCellValue(DataGridViewCell cell, object value)
+    {
+        if (!Equals(cell.Value, value)) cell.Value = value;
     }
 
     static string? GetProcessName(DataGridViewRow row) =>
@@ -318,7 +387,7 @@ internal sealed class ReportForm : Form
             var deleted = _store.DeleteSessionsForProcess(processName);
             _store.AddExclusion(processName, "user-hidden", _clock.UtcNow);
             _onExclusionChanged();
-            ReloadAll();
+            ReloadVisibleTab();
             Log.Information("Deleted {N} sessions for {Name} and added exclusion", deleted, processName);
         }
         catch (Exception ex)
@@ -340,7 +409,7 @@ internal sealed class ReportForm : Form
         {
             Show();
             Activate();
-            ReloadAll();
+            ReloadVisibleTab();
             _refresh.Start();
         }
     }
@@ -351,9 +420,19 @@ internal sealed class ReportForm : Form
         {
             _refresh.Stop();
             _refresh.Dispose();
+            _idleFont.Dispose();
             _iconCache.Dispose();
         }
         base.Dispose(disposing);
+    }
+}
+
+internal sealed class BufferedDataGridView : DataGridView
+{
+    public BufferedDataGridView()
+    {
+        DoubleBuffered = true;
+        SetStyle(ControlStyles.OptimizedDoubleBuffer | ControlStyles.AllPaintingInWmPaint, true);
     }
 }
 
