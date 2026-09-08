@@ -1,5 +1,7 @@
 using FluentAssertions;
 using Microsoft.Data.Sqlite;
+using PcUsageTracker.Core.Models;
+using PcUsageTracker.Core.Reporting;
 using PcUsageTracker.Core.Storage;
 
 namespace PcUsageTracker.Core.Tests;
@@ -21,6 +23,34 @@ public class SqliteStoreTests : IDisposable
     }
 
     static DateTimeOffset T(int seconds) => DateTimeOffset.FromUnixTimeSeconds(1_800_000_000 + seconds);
+
+    void CreateEarlyV5Database(string categoryRows, string ruleRows)
+    {
+        using var conn = new SqliteConnection($"Data Source={_tmp}");
+        conn.Open();
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = $$"""
+            CREATE TABLE schema_version (version INTEGER PRIMARY KEY);
+            INSERT INTO schema_version VALUES (1), (2), (3), (4), (5);
+            CREATE TABLE categories (
+              id INTEGER PRIMARY KEY,
+              name TEXT NOT NULL COLLATE NOCASE UNIQUE,
+              color_rgb INTEGER NOT NULL CHECK(color_rgb BETWEEN 0 AND 16777215),
+              sort_order INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE application_rules (
+              process_name TEXT NOT NULL COLLATE NOCASE PRIMARY KEY,
+              alias TEXT,
+              category_id INTEGER REFERENCES categories(id) ON DELETE SET NULL,
+              color_override_rgb INTEGER CHECK(color_override_rgb BETWEEN 0 AND 16777215),
+              updated_at INTEGER NOT NULL
+            );
+            {{categoryRows}}
+            {{ruleRows}}
+            """;
+        cmd.ExecuteNonQuery();
+        SqliteConnection.ClearAllPools();
+    }
 
     [Fact]
     public void migration_sets_version_to_current()
@@ -328,6 +358,95 @@ public class SqliteStoreTests : IDisposable
     }
 
     [Fact]
+    public void importing_the_same_session_twice_reuses_existing_row()
+    {
+        using var store = new SqliteStore(_tmp);
+
+        var firstId = store.ImportSession("code", T(10), T(70), null);
+        var secondId = store.ImportSession("CODE", T(10), T(70), null);
+
+        secondId.Should().Be(firstId);
+        store.EnumerateSessions().Should().ContainSingle();
+    }
+
+    [Fact]
+    public void import_reconciles_open_to_closed_and_preserves_first_closed_conflict()
+    {
+        using var store = new SqliteStore(_tmp);
+
+        var openId = store.ImportSession("Code", T(10), null, null);
+        var closedId = store.ImportSession("code", T(10), T(70), null);
+        var conflictingId = store.ImportSession("CODE", T(10), T(90), null);
+        var closedThenOpenId = store.ImportSession("cOdE", T(10), null, null);
+
+        closedId.Should().Be(openId);
+        conflictingId.Should().Be(openId);
+        closedThenOpenId.Should().Be(openId);
+        var row = store.EnumerateSessions().Should().ContainSingle().Which;
+        row.EndAtUnix.Should().Be(T(70).ToUnixTimeSeconds());
+        row.DurationSec.Should().Be(60);
+    }
+
+    [Fact]
+    public void atomic_replace_import_rolls_back_clear_and_partial_writes_when_source_fails()
+    {
+        using var store = new SqliteStore(_tmp);
+        store.ImportSession("existing", T(0), T(10), @"C:\Existing.exe");
+
+        IEnumerable<ImportSessionRow> FailingRows()
+        {
+            yield return new ImportSessionRow("new", T(20), T(30), @"C:\New.exe");
+            throw new InvalidDataException("injected import failure");
+        }
+
+        var act = () => store.ImportSessions(FailingRows(), replace: true);
+
+        act.Should().Throw<InvalidDataException>();
+        var row = store.EnumerateSessions().Should().ContainSingle().Which;
+        row.ProcessName.Should().Be("existing");
+        row.ExePath.Should().Be(@"C:\Existing.exe");
+        store.GetProcessPath("new").Should().BeNull();
+    }
+
+    [Fact]
+    public void atomic_append_import_rolls_back_all_rows_when_a_row_is_invalid()
+    {
+        using var store = new SqliteStore(_tmp);
+        var rows = new[]
+        {
+            new ImportSessionRow("valid", T(0), T(10), null),
+            new ImportSessionRow("   ", T(20), T(30), null),
+        };
+
+        var act = () => store.ImportSessions(rows, replace: false);
+
+        act.Should().Throw<ArgumentException>();
+        store.EnumerateSessions().Should().BeEmpty();
+    }
+
+    [Fact]
+    public void v6_installs_indexes_used_by_closed_and_open_overlap_branches()
+    {
+        using var store = new SqliteStore(_tmp);
+        using var cmd = store.Connection.CreateCommand();
+        cmd.CommandText = """
+            EXPLAIN QUERY PLAN
+            SELECT id FROM sessions
+             WHERE end_at IS NOT NULL AND end_at > 100 AND start_at < 200
+            UNION ALL
+            SELECT id FROM sessions
+             WHERE end_at IS NULL AND 300 > 100 AND start_at < 200;
+            """;
+
+        var details = new List<string>();
+        using var reader = cmd.ExecuteReader();
+        while (reader.Read()) details.Add(reader.GetString(3));
+
+        details.Should().Contain(detail => detail.Contains("idx_sessions_end_start", StringComparison.Ordinal));
+        details.Should().Contain(detail => detail.Contains("idx_sessions_open_start", StringComparison.Ordinal));
+    }
+
+    [Fact]
     public void import_session_clamps_negative_duration_to_zero()
     {
         using var store = new SqliteStore(_tmp);
@@ -378,7 +497,7 @@ public class SqliteStoreTests : IDisposable
     }
 
     [Fact]
-    public void migration_v3_db_upgrades_to_v4_preserving_data()
+    public void migration_v3_db_upgrades_to_current_preserving_data()
     {
         // v3 시점 DB를 손수 제작: schema_version=3, settings 테이블 없음, 기존 데이터 시드.
         using (var conn = new Microsoft.Data.Sqlite.SqliteConnection($"Data Source={_tmp}"))
@@ -423,9 +542,9 @@ public class SqliteStoreTests : IDisposable
 
         using var store = new SqliteStore(_tmp);
 
-        // 스키마 버전 4로 올라감
+        // 스키마 최신 버전으로 올라감
         Migrations.ReadVersion(store.Connection).Should().Be(SqliteStore.CurrentSchemaVersion);
-        SqliteStore.CurrentSchemaVersion.Should().Be(4);
+        SqliteStore.CurrentSchemaVersion.Should().Be(6);
 
         // 기존 데이터 보존
         store.EnumerateSessions().Should().HaveCount(1);
@@ -439,5 +558,282 @@ public class SqliteStoreTests : IDisposable
         store.GetSetting("idle_threshold_sec").Should().BeNull();
         store.SetSetting("idle_threshold_sec", "180");
         store.GetSetting("idle_threshold_sec").Should().Be("180");
+    }
+
+    [Fact]
+    public void migration_v4_to_current_preserves_existing_data_and_settings()
+    {
+        using (var conn = new SqliteConnection($"Data Source={_tmp}"))
+        {
+            conn.Open();
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = """
+                CREATE TABLE schema_version (version INTEGER PRIMARY KEY);
+                INSERT INTO schema_version VALUES (1), (2), (3), (4);
+                CREATE TABLE sessions (
+                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  process_name TEXT NOT NULL,
+                  start_at INTEGER NOT NULL,
+                  end_at INTEGER,
+                  duration_sec INTEGER
+                );
+                INSERT INTO sessions (process_name, start_at, end_at, duration_sec)
+                VALUES ('code', 1000, 1060, 60);
+                CREATE TABLE processes (name TEXT PRIMARY KEY, exe_path TEXT, last_seen_at INTEGER NOT NULL);
+                INSERT INTO processes VALUES ('code', 'C:\Apps\code.exe', 1060);
+                CREATE TABLE excluded_processes (name TEXT PRIMARY KEY, reason TEXT, excluded_at INTEGER NOT NULL);
+                INSERT INTO excluded_processes VALUES ('LegacyApp', 'user-hidden', 1000);
+                CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                INSERT INTO settings VALUES ('idle_threshold_sec', '600');
+                """;
+            cmd.ExecuteNonQuery();
+        }
+        SqliteConnection.ClearAllPools();
+
+        using var store = new SqliteStore(_tmp);
+
+        Migrations.ReadVersion(store.Connection).Should().Be(SqliteStore.CurrentSchemaVersion);
+        store.EnumerateSessions().Should().ContainSingle(row => row.ProcessName == "code" && row.DurationSec == 60);
+        store.GetProcessPath("code").Should().Be(@"C:\Apps\code.exe");
+        store.IsExcluded("LegacyApp").Should().BeTrue();
+        store.GetSetting("idle_threshold_sec").Should().Be("600");
+        store.ListCategories().Should().HaveCount(6);
+    }
+
+    [Fact]
+    public void v5_seeds_stable_default_categories()
+    {
+        using var store = new SqliteStore(_tmp);
+        var categories = store.ListCategories();
+
+        categories.Select(c => (c.Id, c.Name, c.ColorRgb)).Should().ContainInOrder(
+            (DefaultApplicationCategories.CodingId, "Coding", DefaultApplicationCategories.CodingColor),
+            (DefaultApplicationCategories.GameId, "Game", DefaultApplicationCategories.GameColor),
+            (DefaultApplicationCategories.CommunicationId, "Communication", DefaultApplicationCategories.CommunicationColor),
+            (DefaultApplicationCategories.BrowsingId, "Browsing", DefaultApplicationCategories.BrowsingColor),
+            (DefaultApplicationCategories.SystemId, "System", DefaultApplicationCategories.SystemColor),
+            (DefaultApplicationCategories.OtherId, "Other", DefaultApplicationCategories.OtherColor));
+    }
+
+    [Fact]
+    public void category_crud_rejects_duplicate_names_and_invalid_colors()
+    {
+        using var store = new SqliteStore(_tmp);
+        var id = store.CreateCategory("Productivity", 0x123456, 5);
+        store.GetCategory(id).Should().Be(new ApplicationCategory(id, "Productivity", 0x123456, 5));
+
+        store.UpdateCategory(id, "Focused work", 0x654321, 7).Should().BeTrue();
+        store.GetCategory(id).Should().Be(new ApplicationCategory(id, "Focused work", 0x654321, 7));
+
+        var duplicate = () => store.CreateCategory("coding", 0, 0);
+        duplicate.Should().Throw<SqliteException>();
+        var invalidLow = () => store.CreateCategory("Invalid low", -1);
+        invalidLow.Should().Throw<ArgumentOutOfRangeException>();
+        var invalidHigh = () => store.CreateCategory("Invalid high", 0x1000000);
+        invalidHigh.Should().Throw<ArgumentOutOfRangeException>();
+    }
+
+    [Fact]
+    public void default_other_identity_is_immutable_but_color_and_order_are_editable()
+    {
+        using var store = new SqliteStore(_tmp);
+        var id = store.Open("plain-app", T(0));
+        store.Close(id, T(10));
+
+        var update = () => store.UpdateCategory(
+            DefaultApplicationCategories.OtherId, "Renamed", 0x010203, 999);
+        update.Should().Throw<InvalidOperationException>();
+        var delete = () => store.DeleteCategory(DefaultApplicationCategories.OtherId);
+        delete.Should().Throw<InvalidOperationException>();
+
+        store.UpdateCategory(DefaultApplicationCategories.OtherId, "Other", 0x223344, 123)
+            .Should().BeTrue();
+
+        // DB triggers preserve the invariant even if a caller bypasses SqliteStore.
+        using (var cmd = store.Connection.CreateCommand())
+        {
+            cmd.CommandText = "UPDATE categories SET name = 'Ghost' WHERE id = 6;";
+            var directUpdate = () => cmd.ExecuteNonQuery();
+            directUpdate.Should().Throw<SqliteException>();
+
+            cmd.CommandText = "UPDATE categories SET id = 99 WHERE id = 6;";
+            var directIdentityUpdate = () => cmd.ExecuteNonQuery();
+            directIdentityUpdate.Should().Throw<SqliteException>();
+
+            cmd.CommandText = "DELETE FROM categories WHERE id = 6;";
+            var directDelete = () => cmd.ExecuteNonQuery();
+            directDelete.Should().Throw<SqliteException>();
+        }
+
+        store.GetCategory(DefaultApplicationCategories.OtherId).Should().Be(new ApplicationCategory(
+            DefaultApplicationCategories.OtherId, "Other", 0x223344, 123));
+        var app = store.ListKnownApplications().Single(a => a.ProcessName == "plain-app");
+        app.CategoryName.Should().Be("Other");
+        app.ResolvedColorRgb.Should().Be(0x223344);
+    }
+
+    [Fact]
+    public void early_v5_relocates_category_reusing_id_six_and_preserves_rule_reference()
+    {
+        CreateEarlyV5Database(
+            "INSERT INTO categories VALUES (6, 'Personal', 1122867, 7);",
+            "INSERT INTO application_rules VALUES ('personal-app', 'Personal alias', 6, NULL, 1000);");
+
+        using var store = new SqliteStore(_tmp);
+        var categories = store.ListCategories();
+        categories.Should().ContainSingle(c => c.Id == 6 && c.Name == "Other");
+        var relocated = categories.Single(c => c.Name == "Personal");
+        relocated.Id.Should().NotBe(6);
+        relocated.ColorRgb.Should().Be(1122867);
+        store.GetApplicationRule("personal-app")!.Value.CategoryId.Should().Be(relocated.Id);
+
+        var id = store.Open("personal-app", T(0));
+        store.Close(id, T(10));
+        var report = new Aggregator(store.Connection).AllTime(T(20)).Single();
+        report.DisplayName.Should().Be("Personal alias");
+        report.CategoryName.Should().Be("Personal");
+        report.ColorRgb.Should().Be(1122867);
+    }
+
+    [Fact]
+    public void early_v5_moves_other_to_id_six_preserving_rules_color_and_is_idempotent()
+    {
+        CreateEarlyV5Database(
+            "INSERT INTO categories VALUES (9, 'other', 1267611, 77);",
+            "INSERT INTO application_rules VALUES ('fallback-app', NULL, 9, NULL, 1000);");
+
+        IReadOnlyList<ApplicationCategory> firstCategories;
+        IReadOnlyList<ApplicationRule> firstRules;
+        using (var store = new SqliteStore(_tmp))
+        {
+            firstCategories = store.ListCategories();
+            firstRules = store.ListApplicationRules();
+            firstCategories.Should().ContainSingle().Which.Should().Be(
+                new ApplicationCategory(6, "Other", 1267611, 77));
+            firstRules.Should().ContainSingle().Which.CategoryId.Should().Be(6);
+
+            var id = store.Open("fallback-app", T(0));
+            store.Close(id, T(10));
+            var report = new Aggregator(store.Connection).AllTime(T(20)).Single();
+            report.CategoryName.Should().Be("Other");
+            report.ColorRgb.Should().Be(1267611);
+        }
+        SqliteConnection.ClearAllPools();
+
+        using var reopened = new SqliteStore(_tmp);
+        reopened.ListCategories().Should().Equal(firstCategories);
+        reopened.ListApplicationRules().Should().Equal(firstRules);
+        new Aggregator(reopened.Connection).AllTime(T(20)).Single().CategoryName.Should().Be("Other");
+    }
+
+    [Fact]
+    public void early_v5_handles_reused_id_six_and_other_at_another_id_together()
+    {
+        CreateEarlyV5Database(
+            """
+            INSERT INTO categories VALUES (6, 'Personal', 1122867, 7);
+            INSERT INTO categories VALUES (9, 'Other', 4478310, 88);
+            """,
+            """
+            INSERT INTO application_rules VALUES ('personal-app', NULL, 6, NULL, 1000);
+            INSERT INTO application_rules VALUES ('other-app', NULL, 9, NULL, 1000);
+            """);
+
+        using var store = new SqliteStore(_tmp);
+        var categories = store.ListCategories();
+        categories.Should().ContainSingle(c => c.Id == 6 && c.Name == "Other" && c.ColorRgb == 4478310);
+        categories.Should().ContainSingle(c => c.Name == "Personal" && c.Id != 6);
+        var personalId = categories.Single(c => c.Name == "Personal").Id;
+        store.GetApplicationRule("personal-app")!.Value.CategoryId.Should().Be(personalId);
+        store.GetApplicationRule("other-app")!.Value.CategoryId.Should().Be(6);
+    }
+
+    [Fact]
+    public void application_rule_roundtrips_and_category_delete_sets_null()
+    {
+        using var store = new SqliteStore(_tmp);
+        var categoryId = store.CreateCategory("Meetings", 0x112233);
+
+        store.UpsertApplicationRule("zoom", "Zoom meetings", categoryId, 0x445566, T(10));
+        store.GetApplicationRule("ZOOM").Should().Be(new ApplicationRule(
+            "zoom", "Zoom meetings", categoryId, 0x445566, T(10)));
+
+        store.DeleteCategory(categoryId).Should().BeTrue();
+        var rule = store.GetApplicationRule("zoom");
+        rule.Should().NotBeNull();
+        rule!.Value.CategoryId.Should().BeNull();
+        rule.Value.Alias.Should().Be("Zoom meetings");
+    }
+
+    [Fact]
+    public void list_known_applications_unions_history_metadata_and_rules_but_omits_idle()
+    {
+        using var store = new SqliteStore(_tmp);
+        store.Open("history-only", T(0));
+        store.UpsertProcessPath("metadata-only", @"C:\Apps\metadata.exe", T(0));
+        store.UpsertApplicationRule("rule-only", "Saved alias", DefaultApplicationCategories.CodingId, null, T(0));
+        store.Open("__IDLE__", T(0));
+
+        var apps = store.ListKnownApplications();
+
+        apps.Select(a => a.ProcessName).Should().BeEquivalentTo("history-only", "metadata-only", "rule-only");
+        apps.Single(a => a.ProcessName == "rule-only").DisplayName.Should().Be("Saved alias");
+        apps.Single(a => a.ProcessName == "rule-only").CategoryName.Should().Be("Coding");
+
+        store.UpsertApplicationRule("metadata-only", "AAA", null, null, T(1));
+        store.ListKnownApplications()[0].ProcessName.Should().Be("metadata-only",
+            "known applications should be re-sorted by their current alias");
+
+        store.DeleteApplicationRule("rule-only");
+        store.ListKnownApplications().Should().NotContain(a => a.ProcessName == "rule-only");
+    }
+
+    [Fact]
+    public void list_known_applications_canonicalizes_casing_and_chooses_latest_non_null_path()
+    {
+        using var store = new SqliteStore(_tmp);
+        store.Open("code", T(0));
+        store.UpsertProcessPath("Code", @"C:\Old\Code.exe", T(10));
+        store.UpsertProcessPath("code", @"D:\New\Code.exe", T(20));
+        store.UpsertApplicationRule("CODE", "Editor", DefaultApplicationCategories.CodingId, null, T(30));
+
+        var app = store.ListKnownApplications().Should().ContainSingle().Which;
+
+        app.ProcessName.Should().Be("CODE", "binary-min casing is deterministic across all discovery sources");
+        app.DisplayName.Should().Be("Editor");
+        app.ExePath.Should().Be(@"D:\New\Code.exe");
+        app.CategoryName.Should().Be("Coding");
+    }
+
+    [Fact]
+    public void application_rule_rejects_idle_and_invalid_override_color()
+    {
+        using var store = new SqliteStore(_tmp);
+
+        var idle = () => store.UpsertApplicationRule("__IDLE__", null, null, null, T(0));
+        idle.Should().Throw<ArgumentException>();
+        var invalid = () => store.UpsertApplicationRule("code", null, null, 0x1000000, T(0));
+        invalid.Should().Throw<ArgumentOutOfRangeException>();
+    }
+
+    [Fact]
+    public async Task independent_read_only_connection_sees_live_data_and_rejects_writes()
+    {
+        using var store = new SqliteStore(_tmp);
+        store.Open("code", T(0));
+
+        using var readOnly = store.OpenReadOnlyConnection();
+        readOnly.Should().NotBeSameAs(store.Connection);
+        using var count = readOnly.CreateCommand();
+        count.CommandText = "SELECT COUNT(*) FROM sessions WHERE process_name = 'code';";
+        Convert.ToInt32(count.ExecuteScalar()).Should().Be(1);
+
+        using var write = readOnly.CreateCommand();
+        write.CommandText = "INSERT INTO sessions(process_name, start_at) VALUES ('blocked', 0);";
+        var act = () => write.ExecuteNonQuery();
+        act.Should().Throw<SqliteException>();
+
+        await Task.Run(() => store.UpsertProcessPathIndependent("code", @"C:\Apps\Code.exe", T(1)));
+        store.GetProcessPath("code").Should().Be(@"C:\Apps\Code.exe");
     }
 }

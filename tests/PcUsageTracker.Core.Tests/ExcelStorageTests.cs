@@ -1,5 +1,6 @@
 using FluentAssertions;
 using Microsoft.Data.Sqlite;
+using PcUsageTracker.Core.Reporting;
 using PcUsageTracker.Core.Storage;
 
 namespace PcUsageTracker.Core.Tests;
@@ -105,6 +106,65 @@ public class ExcelStorageTests : IDisposable
     }
 
     [Fact]
+    public void appending_the_same_workbook_twice_does_not_duplicate_usage()
+    {
+        using (var src = new SqliteStore(_dbA))
+        {
+            var id = src.Open("code", T(0));
+            src.Close(id, T(60));
+            ExcelStorage.Export(src, _xlsx).Should().Be(1);
+        }
+        SqliteConnection.ClearAllPools();
+
+        using var dst = new SqliteStore(_dbB);
+        ExcelStorage.Import(dst, _xlsx, ImportMode.Append).Should().Be(1);
+        ExcelStorage.Import(dst, _xlsx, ImportMode.Append).Should().Be(1);
+
+        dst.EnumerateSessions().Should().ContainSingle();
+        new Aggregator(dst.Connection).AllTime(T(120)).Single().TotalSeconds.Should().Be(60);
+    }
+
+    [Fact]
+    public void append_import_updates_matching_open_row_when_later_export_is_closed()
+    {
+        using var src = new SqliteStore(_dbA);
+        var sourceId = src.Open("code", T(0));
+        ExcelStorage.Export(src, _xlsx).Should().Be(1);
+
+        using var dst = new SqliteStore(_dbB);
+        ExcelStorage.Import(dst, _xlsx, ImportMode.Append).Should().Be(1);
+        dst.EnumerateSessions().Single().EndAtUnix.Should().BeNull();
+
+        src.Close(sourceId, T(60));
+        ExcelStorage.Export(src, _xlsx).Should().Be(1);
+        ExcelStorage.Import(dst, _xlsx, ImportMode.Append).Should().Be(1);
+
+        var row = dst.EnumerateSessions().Should().ContainSingle().Which;
+        row.EndAtUnix.Should().Be(T(60).ToUnixTimeSeconds());
+        row.DurationSec.Should().Be(60);
+    }
+
+    [Fact]
+    public void import_then_reexport_preserves_latest_path_across_process_casing()
+    {
+        using (var src = new SqliteStore(_dbA))
+        {
+            src.ImportSession("Code", T(0), T(60), @"C:\Old\Code.exe");
+            src.ImportSession("code", T(0), T(60), @"D:\New\Code.exe");
+            src.EnumerateSessions().Should().ContainSingle().Which.ExePath.Should().Be(@"D:\New\Code.exe");
+            ExcelStorage.Export(src, _xlsx).Should().Be(1);
+        }
+        SqliteConnection.ClearAllPools();
+
+        using var dst = new SqliteStore(_dbB);
+        ExcelStorage.Import(dst, _xlsx, ImportMode.Replace).Should().Be(1);
+
+        var imported = dst.EnumerateSessions().Should().ContainSingle().Which;
+        imported.ProcessName.Should().Be("Code");
+        imported.ExePath.Should().Be(@"D:\New\Code.exe");
+    }
+
+    [Fact]
     public void replace_mode_deletes_existing_then_inserts()
     {
         using (var src = new SqliteStore(_dbA))
@@ -180,5 +240,27 @@ public class ExcelStorageTests : IDisposable
         using var dst = new SqliteStore(_dbB);
         var act = () => ExcelStorage.Import(dst, _xlsx, ImportMode.Append);
         act.Should().Throw<InvalidDataException>();
+    }
+
+    [Fact]
+    public void invalid_replace_workbook_does_not_clear_existing_data()
+    {
+        using (var wb = new ClosedXML.Excel.XLWorkbook())
+        {
+            var ws = wb.Worksheets.Add("Sessions");
+            ws.Cell(1, 1).Value = "ProcessName";
+            ws.Cell(1, 2).Value = "StartUtc";
+            ws.Cell(2, 1).Value = "new";
+            ws.Cell(2, 2).Value = "not-a-date";
+            wb.SaveAs(_xlsx);
+        }
+
+        using var dst = new SqliteStore(_dbB);
+        dst.ImportSession("existing", T(0), T(10), null);
+
+        var act = () => ExcelStorage.Import(dst, _xlsx, ImportMode.Replace);
+
+        act.Should().Throw<InvalidDataException>();
+        dst.EnumerateSessions().Should().ContainSingle().Which.ProcessName.Should().Be("existing");
     }
 }

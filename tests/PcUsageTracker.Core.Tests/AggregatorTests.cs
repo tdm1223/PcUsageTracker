@@ -1,6 +1,8 @@
 using FluentAssertions;
 using Microsoft.Data.Sqlite;
+using PcUsageTracker.Core.Models;
 using PcUsageTracker.Core.Reporting;
+using PcUsageTracker.Core.Sampling;
 using PcUsageTracker.Core.Storage;
 
 namespace PcUsageTracker.Core.Tests;
@@ -111,6 +113,44 @@ public class AggregatorTests : IDisposable
     }
 
     [Fact]
+    public void alltime_ignores_future_open_session_in_both_overloads()
+    {
+        Seed("historical", 0, 10);
+        _store.Open("future", T(100));
+
+        var unbounded = _agg.AllTime(T(50));
+        var limited = _agg.AllTime(T(50), 10);
+
+        unbounded.Should().ContainSingle();
+        unbounded[0].ProcessName.Should().Be("historical");
+        unbounded[0].TotalSeconds.Should().Be(10);
+        limited.Should().BeEquivalentTo(unbounded);
+        unbounded.Should().OnlyContain(entry => entry.TotalSeconds >= 0);
+    }
+
+    [Fact]
+    public void process_identity_is_case_insensitive_with_deterministic_canonical_name()
+    {
+        Seed("code", 0, 10);
+        Seed("Code", 10, 30);
+        Seed("CODE", 30, 60);
+        _store.UpsertApplicationRule("cOdE", "Editor", DefaultApplicationCategories.CodingId, null, T(70));
+
+        var ranged = _agg.TopN(T(0), T(100), T(100));
+        var allTime = _agg.AllTime(T(100));
+
+        ranged.Should().ContainSingle();
+        ranged[0].ProcessName.Should().Be("CODE", "binary-min casing is a stable row-action identity");
+        ranged[0].DisplayName.Should().Be("Editor");
+        ranged[0].TotalSeconds.Should().Be(60);
+        allTime.Should().ContainSingle();
+        allTime[0].Should().BeEquivalentTo(ranged[0]);
+
+        _store.DeleteSessionsForProcess(ranged[0].ProcessName).Should().Be(3);
+        _agg.AllTime(T(100)).Should().BeEmpty();
+    }
+
+    [Fact]
     public void empty_db_returns_empty()
     {
         var today = _agg.TopN(T(0), T(86400), T(86400), 5);
@@ -148,6 +188,60 @@ public class AggregatorTests : IDisposable
         var result = _agg.AllTime(T(1000), 5);
         result.Should().HaveCount(1);
         result[0].ExePath.Should().Be(@"C:\Apps\chrome.exe");
+    }
+
+    [Fact]
+    public void application_rule_changes_display_for_historical_and_future_sessions()
+    {
+        Seed("code", 0, 100);
+        var before = _agg.AllTime(T(200)).Single();
+        before.DisplayName.Should().Be("code");
+        before.CategoryName.Should().Be("Other");
+        before.ColorRgb.Should().Be(DefaultApplicationCategories.OtherColor);
+
+        _store.UpsertApplicationRule(
+            "CODE", "Visual Studio Code", DefaultApplicationCategories.CodingId, null, T(200));
+
+        var historical = _agg.AllTime(T(200)).Single();
+        historical.ProcessName.Should().Be("code");
+        historical.DisplayName.Should().Be("Visual Studio Code");
+        historical.CategoryName.Should().Be("Coding");
+        historical.ColorRgb.Should().Be(DefaultApplicationCategories.CodingColor);
+
+        Seed("code", 300, 350);
+        var withFutureSession = _agg.AllTime(T(400)).Single();
+        withFutureSession.TotalSeconds.Should().Be(150);
+        withFutureSession.DisplayName.Should().Be("Visual Studio Code");
+    }
+
+    [Fact]
+    public void application_color_override_takes_precedence_over_category_color()
+    {
+        Seed("code", 0, 10);
+        _store.UpsertApplicationRule(
+            "code", null, DefaultApplicationCategories.CodingId, 0xABCDEF, T(20));
+
+        _agg.AllTime(T(30)).Single().ColorRgb.Should().Be(0xABCDEF);
+    }
+
+    [Fact]
+    public void mixed_case_idle_sessions_are_combined_with_fixed_presentation()
+    {
+        Seed("__idle__", 0, 10);
+        Seed("__IDLE__", 10, 30);
+        Seed("__Idle__", 30, 60);
+
+        var idle = _agg.AllTime(T(20)).Single();
+        idle.ProcessName.Should().Be(IdleSentinel.Name);
+        idle.TotalSeconds.Should().Be(60);
+        idle.DisplayName.Should().Be("(Idle)");
+        idle.CategoryName.Should().BeNull();
+        idle.ColorRgb.Should().Be(DefaultApplicationCategories.IdleColor);
+
+        var ranged = _agg.TopN(T(0), T(100), T(100));
+        ranged.Should().ContainSingle();
+        ranged[0].ProcessName.Should().Be(IdleSentinel.Name);
+        ranged[0].TotalSeconds.Should().Be(60);
     }
 
     [Fact]

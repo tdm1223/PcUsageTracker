@@ -59,7 +59,8 @@ public static class ExcelStorage
     /// 모드별 동작:
     ///   Append  — 기존 데이터 유지, 신규 row 추가
     ///   Replace — sessions/processes 전체 wipe 후 신규 row insert (excluded_processes는 보존)
-    /// 삽입된 row 수 반환.
+    /// 처리된 row 수 반환. Append에서 이미 존재하는 동일 process/start/end row는
+    /// SqliteStore가 재사용하므로 실제 신규 삽입 수보다 클 수 있다.
     /// 파싱 실패 row는 스킵하지 않고 즉시 throw — 사용자가 잘못된 파일임을 알 수 있게.
     /// </summary>
     public static int Import(SqliteStore store, string xlsxPath, ImportMode mode)
@@ -105,13 +106,9 @@ public static class ExcelStorage
             parsed.Add((name, start, end, string.IsNullOrEmpty(pathStr) ? null : pathStr));
         }
 
-        if (mode == ImportMode.Replace)
-            store.ClearAllSessions();
-
-        foreach (var p in parsed)
-            store.ImportSession(p.Name, p.Start, p.End, p.Path);
-
-        return parsed.Count;
+        return store.ImportSessions(
+            parsed.Select(p => new ImportSessionRow(p.Name, p.Start, p.End, p.Path)),
+            replace: mode == ImportMode.Replace);
     }
 
     static string ToIso(long unixSeconds) =>

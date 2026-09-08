@@ -2,9 +2,9 @@ using System.Diagnostics;
 using PcUsageTracker.App.Assets;
 using PcUsageTracker.App.Autostart;
 using PcUsageTracker.App.Interop;
-using PcUsageTracker.Core.Reporting;
 using PcUsageTracker.Core.Sampling;
 using PcUsageTracker.Core.Storage;
+using PcUsageTracker.Core.Updates;
 using Serilog;
 
 namespace PcUsageTracker.App;
@@ -14,6 +14,7 @@ internal sealed class TrayContext : ApplicationContext
     const int TickIntervalMs = 1000;
     const int DefaultIdleThresholdSec = 180;
     const string IdleThresholdSettingKey = "idle_threshold_sec";
+    const string LastUpdateCheckSettingKey = "update_last_check_utc";
 
     readonly NotifyIcon _notifyIcon;
     readonly SqliteStore _store;
@@ -23,15 +24,22 @@ internal sealed class TrayContext : ApplicationContext
     readonly IdleDetector _idleDetector;
     readonly IClock _clock;
     readonly System.Windows.Forms.Timer _timer;
+    readonly System.Windows.Forms.Timer _automaticUpdateTimer;
     readonly SessionEventsWindow _events;
-    readonly Aggregator _aggregator;
     readonly OwnedIcon _iconActive;
     readonly OwnedIcon _iconPaused;
     readonly HashSet<string> _excluded = new(StringComparer.OrdinalIgnoreCase);
+    readonly HttpClient _updateHttpClient;
+    readonly UpdateCoordinator _updateCoordinator;
+    readonly UpdateApplier _updateApplier = new();
+    readonly CancellationTokenSource _updateLifetime = new();
     bool _lastPausedState;
     bool _lastIdleState;
+    bool _updateCheckInProgress;
+    bool _exitingForUpdate;
     ReportForm? _reportForm;
     ToolStripMenuItem? _autostartMenuItem;
+    ToolStripMenuItem? _checkForUpdatesMenuItem;
 
     public TrayContext(bool startedFromLogin)
     {
@@ -43,12 +51,17 @@ internal sealed class TrayContext : ApplicationContext
         Directory.CreateDirectory(dataDir);
         var dbPath = Path.Combine(dataDir, "history.db");
         _store = new SqliteStore(dbPath);
+        _updateHttpClient = new HttpClient { Timeout = TimeSpan.FromMinutes(10) };
+        _updateCoordinator = new UpdateCoordinator(
+            new GitHubReleaseClient(_updateHttpClient),
+            AppVersion.Current(),
+            Path.Combine(dataDir, "updates"));
+        _updateCoordinator.CleanupStaleStaging(_clock.UtcNow, Environment.ProcessPath);
 
         var recovered = _store.RecoverOrphanedSessions(_clock.UtcNow);
         if (recovered > 0) Log.Information("Recovered {N} orphaned session(s) on startup", recovered);
 
         _recorder = new SessionRecorder(_store);
-        _aggregator = new Aggregator(_store.Connection);
         _idleDetector = new IdleDetector(TimeSpan.FromSeconds(LoadIdleThresholdSec()));
         RefreshExclusions();
 
@@ -74,13 +87,18 @@ internal sealed class TrayContext : ApplicationContext
         _timer.Tick += OnTick;
         _timer.Start();
 
+        _automaticUpdateTimer = new System.Windows.Forms.Timer();
+        _automaticUpdateTimer.Tick += OnAutomaticUpdateTick;
+        ScheduleAutomaticUpdateCheck(initialDelay: true);
+
         EnsureAutostartFirstRun();
         RunKeyRegistrar.ReconcilePath(ExePath);
 
         Log.Information("Tray icon shown (startedFromLogin={FromLogin}, db={Db})", startedFromLogin, dbPath);
     }
 
-    static string ExePath => Process.GetCurrentProcess().MainModule?.FileName
+    static string ExePath => Environment.ProcessPath
+                             ?? Process.GetCurrentProcess().MainModule?.FileName
                              ?? throw new InvalidOperationException("Cannot resolve exe path");
 
     static string AutostartMarkerPath => Path.Combine(GetDataFolder(), ".autostart_initialized");
@@ -119,6 +137,7 @@ internal sealed class TrayContext : ApplicationContext
         menu.Items.Add(new ToolStripSeparator());
 
         menu.Items.Add("Idle threshold...", image: null, OnIdleSettings);
+        menu.Items.Add("Applications && categories...", image: null, OnApplicationRules);
         menu.Items.Add(new ToolStripSeparator());
 
         _autostartMenuItem = new ToolStripMenuItem("Autostart on Windows login")
@@ -129,6 +148,9 @@ internal sealed class TrayContext : ApplicationContext
         _autostartMenuItem.CheckedChanged += OnAutostartToggled;
         menu.Items.Add(_autostartMenuItem);
 
+        _checkForUpdatesMenuItem = new ToolStripMenuItem("Check for updates...");
+        _checkForUpdatesMenuItem.Click += OnCheckForUpdates;
+        menu.Items.Add(_checkForUpdatesMenuItem);
         menu.Items.Add("Open data folder", image: null, OnOpenDataFolder);
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add("Quit", image: null, OnQuit);
@@ -185,10 +207,10 @@ internal sealed class TrayContext : ApplicationContext
 
         try
         {
-            var imported = ExcelStorage.Import(_store, dlg.FileName, mode.Value);
+            var imported = ImportWithRecorderSuspended(dlg.FileName, mode.Value);
             Log.Information("Excel import complete: {N} sessions ({Mode}) ← {Path}", imported, mode, dlg.FileName);
 
-            if (_reportForm is { IsDisposed: false, Visible: true })
+            if (_reportForm is { IsDisposed: false })
                 _reportForm.RequestReload();
 
             MessageBox.Show(
@@ -200,6 +222,32 @@ internal sealed class TrayContext : ApplicationContext
             Log.Error(ex, "Excel import failed for {Path}", dlg.FileName);
             MessageBox.Show($"Import failed:\n\n{ex.Message}", "Error",
                 MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
+    }
+
+    int ImportWithRecorderSuspended(string path, ImportMode mode)
+    {
+        // Import can replace the row currently owned by SessionRecorder. Close it first so the
+        // recorder never retains an ID that the transaction deleted, then immediately observe
+        // foreground state again after success or rollback. A lock/suspend pause remains intact.
+        var pausedForImport = false;
+        try
+        {
+            if (!_recorder.IsPaused)
+            {
+                _recorder.Pause(_clock.UtcNow);
+                pausedForImport = true;
+            }
+
+            return ExcelStorage.Import(_store, path, mode);
+        }
+        finally
+        {
+            if (pausedForImport)
+            {
+                _recorder.Resume();
+                OnTick(this, EventArgs.Empty);
+            }
         }
     }
 
@@ -248,6 +296,14 @@ internal sealed class TrayContext : ApplicationContext
         }
     }
 
+    void OnApplicationRules(object? sender, EventArgs e)
+    {
+        using var dialog = new ApplicationRulesForm(_store);
+        dialog.ShowDialog();
+        if (_reportForm is { IsDisposed: false })
+            _reportForm.RequestReload();
+    }
+
     void OnAutostartToggled(object? sender, EventArgs e)
     {
         if (_autostartMenuItem is null) return;
@@ -261,6 +317,156 @@ internal sealed class TrayContext : ApplicationContext
             _autostartMenuItem.Checked = RunKeyRegistrar.IsRegistered();
             _autostartMenuItem.CheckedChanged += OnAutostartToggled;
         }
+    }
+
+    async void OnCheckForUpdates(object? sender, EventArgs e) =>
+        await CheckForUpdatesAsync(manual: true);
+
+    async void OnAutomaticUpdateTick(object? sender, EventArgs e)
+    {
+        _automaticUpdateTimer.Stop();
+        await CheckForUpdatesAsync(manual: false);
+    }
+
+    async Task CheckForUpdatesAsync(bool manual)
+    {
+        if (_updateCheckInProgress)
+        {
+            if (manual)
+                MessageBox.Show("An update check is already in progress.", "PcUsageTracker update",
+                    MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+
+        var now = _clock.UtcNow;
+        if (!manual && !UpdateCoordinator.IsAutomaticCheckDue(
+                _store.GetSetting(LastUpdateCheckSettingKey), now))
+        {
+            ScheduleAutomaticUpdateCheck(initialDelay: false);
+            return;
+        }
+
+        _updateCheckInProgress = true;
+        _automaticUpdateTimer.Stop();
+        if (_checkForUpdatesMenuItem is not null)
+        {
+            _checkForUpdatesMenuItem.Enabled = false;
+            _checkForUpdatesMenuItem.Text = "Checking for updates...";
+        }
+        try
+        {
+            // Persist attempts, including failures, so an offline machine is not contacted every minute.
+            _store.SetSetting(
+                LastUpdateCheckSettingKey,
+                UpdateCoordinator.FormatStoredCheckTime(now));
+
+            var result = await _updateCoordinator.CheckAsync(_updateLifetime.Token);
+            if (!result.IsUpdateAvailable)
+            {
+                if (manual)
+                    MessageBox.Show(
+                        $"PcUsageTracker {result.CurrentVersion} is up to date.",
+                        "PcUsageTracker update",
+                        MessageBoxButtons.OK,
+                        MessageBoxIcon.Information);
+                return;
+            }
+
+            var release = result.LatestRelease;
+            var targetValidation = _updateApplier.ValidateCurrentTarget(ExePath, Environment.ProcessId);
+            if (!targetValidation.IsValid)
+            {
+                Log.Warning("Self-update target rejected: {Error}", targetValidation.Error);
+                if (manual)
+                    MessageBox.Show(
+                        $"This copy cannot update itself safely. Install the release executable manually.\n\n{targetValidation.Error}",
+                        "PcUsageTracker update",
+                        MessageBoxButtons.OK,
+                        MessageBoxIcon.Warning);
+                return;
+            }
+
+            var answer = MessageBox.Show(
+                $"PcUsageTracker {release.Version} is available (current: {result.CurrentVersion}).\n\n" +
+                "Download, verify, and install it now? The app will restart automatically.",
+                "PcUsageTracker update",
+                MessageBoxButtons.YesNo,
+                MessageBoxIcon.Information,
+                MessageBoxDefaultButton.Button2);
+            if (answer != DialogResult.Yes) return;
+
+            if (_checkForUpdatesMenuItem is not null)
+                _checkForUpdatesMenuItem.Text = "Downloading update...";
+            var prepared = await _updateCoordinator.DownloadAsync(release, _updateLifetime.Token);
+            var markerPath = Path.Combine(
+                _updateCoordinator.StagingDirectory,
+                $"ready-{Guid.NewGuid():N}.ready");
+            var acceptanceMarkerPath = Path.Combine(
+                _updateCoordinator.StagingDirectory,
+                $"accept-{Guid.NewGuid():N}.accept");
+            var launch = await _updateApplier.LaunchHelperAndWaitForAcceptanceAsync(
+                prepared,
+                ExePath,
+                Environment.ProcessId,
+                _updateCoordinator.StagingDirectory,
+                acceptanceMarkerPath,
+                markerPath,
+                _updateLifetime.Token);
+            if (!launch.Started || !launch.Accepted)
+            {
+                MessageBox.Show(
+                    $"The update helper did not accept the installation. The current app will keep running.\n\n{launch.Error}",
+                    "PcUsageTracker update",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Warning);
+                return;
+            }
+
+            _exitingForUpdate = true;
+            Log.Information("Verified update {Version} staged; helper started (elevated={Elevated})",
+                prepared.Version, launch.Elevated);
+            ExitThread();
+        }
+        catch (OperationCanceledException)
+        {
+            if (manual && !_updateLifetime.IsCancellationRequested)
+                MessageBox.Show("The update was canceled.", "PcUsageTracker update",
+                    MessageBoxButtons.OK, MessageBoxIcon.Information);
+        }
+        catch (Exception ex)
+        {
+            Log.Warning(ex, "{Kind} update check failed", manual ? "Manual" : "Automatic");
+            if (manual)
+                MessageBox.Show(
+                    $"The update check failed.\n\n{ex.Message}",
+                    "PcUsageTracker update",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Warning);
+        }
+        finally
+        {
+            _updateCheckInProgress = false;
+            if (_checkForUpdatesMenuItem is not null)
+            {
+                _checkForUpdatesMenuItem.Text = "Check for updates...";
+                _checkForUpdatesMenuItem.Enabled = true;
+            }
+            if (!_exitingForUpdate && !_updateLifetime.IsCancellationRequested)
+                ScheduleAutomaticUpdateCheck(initialDelay: false);
+        }
+    }
+
+    void ScheduleAutomaticUpdateCheck(bool initialDelay)
+    {
+        if (_updateLifetime.IsCancellationRequested) return;
+        var now = _clock.UtcNow;
+        var delay = UpdateCoordinator.DelayUntilAutomaticCheck(
+            _store.GetSetting(LastUpdateCheckSettingKey), now);
+        if (initialDelay && delay <= TimeSpan.Zero) delay = TimeSpan.FromSeconds(30);
+        if (delay <= TimeSpan.Zero) delay = TimeSpan.FromSeconds(1);
+        _automaticUpdateTimer.Stop();
+        _automaticUpdateTimer.Interval = (int)Math.Clamp(delay.TotalMilliseconds, 1_000, int.MaxValue);
+        _automaticUpdateTimer.Start();
     }
 
     /// <summary>excluded_processes 테이블을 in-memory 캐시로 다시 로드. UI에서 exclusion 변경 시 호출.</summary>
@@ -302,7 +508,7 @@ internal sealed class TrayContext : ApplicationContext
             _recorder.Tick(effectiveName, now);
 
             if (effectiveName is not null
-                && effectiveName != IdleSentinel.Name
+                && !string.Equals(effectiveName, IdleSentinel.Name, StringComparison.OrdinalIgnoreCase)
                 && snap is { ExePath: { } path }
                 && !string.IsNullOrEmpty(path))
             {
@@ -369,7 +575,7 @@ internal sealed class TrayContext : ApplicationContext
     void OnOpenReport(object? sender, EventArgs e)
     {
         if (_reportForm is null || _reportForm.IsDisposed)
-            _reportForm = new ReportForm(_aggregator, _clock, _store, RefreshExclusions);
+            _reportForm = new ReportForm(_clock, _store, RefreshExclusions);
         _reportForm.ToggleVisible();
     }
 
@@ -387,6 +593,7 @@ internal sealed class TrayContext : ApplicationContext
     void OnQuit(object? sender, EventArgs e)
     {
         Log.Information("Quit requested from tray menu");
+        _updateLifetime.Cancel();
         ExitThread();
     }
 
@@ -396,12 +603,17 @@ internal sealed class TrayContext : ApplicationContext
         {
             _timer.Stop();
             _timer.Dispose();
+            _automaticUpdateTimer.Stop();
+            _automaticUpdateTimer.Dispose();
+            _updateLifetime.Cancel();
             // 종료 직전 현재 세션을 닫는다 — 다음 실행 시 orphan recovery로 대체되지만 선제 정리.
             _recorder.Pause(_clock.UtcNow);
             _notifyIcon.Visible = false;
             _notifyIcon.Dispose();
             _iconActive.Dispose();
             _iconPaused.Dispose();
+            _updateHttpClient.Dispose();
+            _updateLifetime.Dispose();
             _reportForm?.Dispose();
             _events.Dispose();
             _store.Dispose();

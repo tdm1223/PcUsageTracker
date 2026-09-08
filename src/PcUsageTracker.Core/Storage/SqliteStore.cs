@@ -1,4 +1,5 @@
 using Microsoft.Data.Sqlite;
+using PcUsageTracker.Core.Models;
 using PcUsageTracker.Core.Sampling;
 
 namespace PcUsageTracker.Core.Storage;
@@ -10,15 +11,17 @@ namespace PcUsageTracker.Core.Storage;
 public sealed class SqliteStore : ISessionSink, IDisposable
 {
     public const int OrphanedCapSeconds = 86400; // 비정상 종료 후 복구 시 24시간 cap
-    public const int CurrentSchemaVersion = 4;
+    public const int CurrentSchemaVersion = 6;
 
     readonly SqliteConnection _conn;
+    readonly string _dbPath;
 
     public SqliteStore(string dbPath)
     {
+        _dbPath = Path.GetFullPath(dbPath);
         var builder = new SqliteConnectionStringBuilder
         {
-            DataSource = dbPath,
+            DataSource = _dbPath,
             Mode = SqliteOpenMode.ReadWriteCreate,
             Cache = SqliteCacheMode.Default,
         };
@@ -88,10 +91,67 @@ public sealed class SqliteStore : ISessionSink, IDisposable
 
     public SqliteConnection Connection => _conn;
 
+    /// <summary>
+    /// Opens an independent query-only connection suitable for background reporting. The live
+    /// recorder connection is intentionally never shared across threads.
+    /// </summary>
+    public SqliteConnection OpenReadOnlyConnection()
+    {
+        var builder = new SqliteConnectionStringBuilder
+        {
+            DataSource = _dbPath,
+            Mode = SqliteOpenMode.ReadOnly,
+            Cache = SqliteCacheMode.Default,
+            Pooling = false,
+        };
+        var connection = new SqliteConnection(builder.ConnectionString);
+        connection.Open();
+        using var cmd = connection.CreateCommand();
+        cmd.CommandText = "PRAGMA query_only = ON; PRAGMA busy_timeout = 3000;";
+        cmd.ExecuteNonQuery();
+        return connection;
+    }
+
     /// <summary>processes 테이블에 exe 경로를 upsert. 아이콘 추출 등 UI 메타데이터 용도.</summary>
     public void UpsertProcessPath(string processName, string exePath, DateTimeOffset at)
+        => UpsertProcessPathCore(processName, exePath, at, transaction: null);
+
+    /// <summary>
+    /// Persists metadata from a background resolver without touching the recorder's connection.
+    /// </summary>
+    public void UpsertProcessPathIndependent(string processName, string exePath, DateTimeOffset at)
+    {
+        var builder = new SqliteConnectionStringBuilder
+        {
+            DataSource = _dbPath,
+            Mode = SqliteOpenMode.ReadWrite,
+            Cache = SqliteCacheMode.Default,
+            Pooling = false,
+        };
+        using var connection = new SqliteConnection(builder.ConnectionString);
+        connection.Open();
+        using var cmd = connection.CreateCommand();
+        cmd.CommandText = """
+            PRAGMA busy_timeout = 3000;
+            INSERT INTO processes (name, exe_path, last_seen_at) VALUES ($n, $p, $t)
+            ON CONFLICT(name) DO UPDATE SET
+              exe_path = excluded.exe_path,
+              last_seen_at = excluded.last_seen_at;
+            """;
+        cmd.Parameters.AddWithValue("$n", processName);
+        cmd.Parameters.AddWithValue("$p", exePath);
+        cmd.Parameters.AddWithValue("$t", at.ToUnixTimeSeconds());
+        cmd.ExecuteNonQuery();
+    }
+
+    void UpsertProcessPathCore(
+        string processName,
+        string exePath,
+        DateTimeOffset at,
+        SqliteTransaction? transaction)
     {
         using var cmd = _conn.CreateCommand();
+        cmd.Transaction = transaction;
         cmd.CommandText = """
             INSERT INTO processes (name, exe_path, last_seen_at) VALUES ($n, $p, $t)
             ON CONFLICT(name) DO UPDATE SET
@@ -117,7 +177,7 @@ public sealed class SqliteStore : ISessionSink, IDisposable
     public bool IsExcluded(string processName)
     {
         using var cmd = _conn.CreateCommand();
-        cmd.CommandText = "SELECT 1 FROM excluded_processes WHERE name = $n LIMIT 1;";
+        cmd.CommandText = "SELECT 1 FROM excluded_processes WHERE name = $n COLLATE NOCASE LIMIT 1;";
         cmd.Parameters.AddWithValue("$n", processName);
         return cmd.ExecuteScalar() is not null;
     }
@@ -153,7 +213,7 @@ public sealed class SqliteStore : ISessionSink, IDisposable
     public void RemoveExclusion(string processName)
     {
         using var cmd = _conn.CreateCommand();
-        cmd.CommandText = "DELETE FROM excluded_processes WHERE name = $n;";
+        cmd.CommandText = "DELETE FROM excluded_processes WHERE name = $n COLLATE NOCASE;";
         cmd.Parameters.AddWithValue("$n", processName);
         cmd.ExecuteNonQuery();
     }
@@ -166,9 +226,13 @@ public sealed class SqliteStore : ISessionSink, IDisposable
     {
         using var cmd = _conn.CreateCommand();
         cmd.CommandText = """
-            SELECT s.process_name, s.start_at, s.end_at, s.duration_sec, p.exe_path
+            SELECT s.process_name, s.start_at, s.end_at, s.duration_sec,
+              (SELECT p.exe_path
+                 FROM processes p
+                WHERE p.name = s.process_name COLLATE NOCASE
+                ORDER BY (p.exe_path IS NOT NULL) DESC, p.last_seen_at DESC, p.name COLLATE BINARY
+                LIMIT 1) AS exe_path
             FROM sessions s
-            LEFT JOIN processes p ON p.name = s.process_name
             ORDER BY s.id;
             """;
         using var r = cmd.ExecuteReader();
@@ -190,33 +254,128 @@ public sealed class SqliteStore : ISessionSink, IDisposable
     public int ClearAllSessions()
     {
         using var tx = _conn.BeginTransaction();
+        var deleted = ClearAllSessionsCore(tx);
+        tx.Commit();
+        return deleted;
+    }
+
+    int ClearAllSessionsCore(SqliteTransaction transaction)
+    {
         int deleted;
         using (var cmd = _conn.CreateCommand())
         {
-            cmd.Transaction = tx;
+            cmd.Transaction = transaction;
             cmd.CommandText = "DELETE FROM sessions;";
             deleted = cmd.ExecuteNonQuery();
             cmd.CommandText = "DELETE FROM processes;";
             cmd.ExecuteNonQuery();
         }
-        tx.Commit();
         return deleted;
     }
 
     /// <summary>
     /// Excel import 등 외부 입력으로부터 단건 session row를 삽입. duration_sec는 endAt 주어진 경우 자동 계산.
     /// exePath가 non-null이면 processes 테이블에 UpsertProcessPath와 동일하게 반영.
-    /// 새 session id 반환.
+    /// 새 session id 반환. Import identity는 process_name(NOCASE) + start_at이다.
+    /// 기존 open row에 closed row가 들어오면 기존 row를 close하고, closed→open 및 서로 다른
+    /// closed end 충돌은 먼저 저장된 row를 보존한다. Append 재실행으로 사용 시간이 중복되지 않는다.
     /// </summary>
     public long ImportSession(string processName, DateTimeOffset startAt, DateTimeOffset? endAt, string? exePath)
     {
-        long id;
-        using var cmd = _conn.CreateCommand();
-        if (endAt is { } e)
+        processName = ValidateProcessName(processName);
+        using var transaction = _conn.BeginTransaction();
+        var id = ImportSessionCore(processName, startAt, endAt, exePath, transaction);
+        transaction.Commit();
+        return id;
+    }
+
+    /// <summary>
+    /// Imports a sequence atomically. Replace clears session/process data inside the same
+    /// transaction, so enumeration, validation, or SQLite failures restore all previous data.
+    /// Returns the number of input rows processed (idempotent matches are included).
+    /// </summary>
+    public int ImportSessions(IEnumerable<ImportSessionRow> sessions, bool replace)
+    {
+        ArgumentNullException.ThrowIfNull(sessions);
+        using var transaction = _conn.BeginTransaction();
+        if (replace) ClearAllSessionsCore(transaction);
+
+        var count = 0;
+        foreach (var row in sessions)
         {
-            var startUnix = startAt.ToUnixTimeSeconds();
-            var endUnix = e.ToUnixTimeSeconds();
-            var duration = endUnix - startUnix;
+            var processName = ValidateProcessName(row.ProcessName);
+            ImportSessionCore(processName, row.StartAt, row.EndAt, row.ExePath, transaction);
+            count++;
+        }
+
+        transaction.Commit();
+        return count;
+    }
+
+    long ImportSessionCore(
+        string processName,
+        DateTimeOffset startAt,
+        DateTimeOffset? endAt,
+        string? exePath,
+        SqliteTransaction transaction)
+    {
+        var startUnix = startAt.ToUnixTimeSeconds();
+        var endUnix = endAt?.ToUnixTimeSeconds();
+        long id;
+
+        long? existingId = null;
+        long? existingEndUnix = null;
+        string? existingProcessName = null;
+        using (var existing = _conn.CreateCommand())
+        {
+            existing.Transaction = transaction;
+            existing.CommandText = """
+                SELECT id, process_name, end_at
+                FROM sessions
+                WHERE process_name = $p COLLATE NOCASE
+                  AND start_at = $s
+                ORDER BY id
+                LIMIT 1;
+                """;
+            existing.Parameters.AddWithValue("$p", processName);
+            existing.Parameters.AddWithValue("$s", startUnix);
+            using var reader = existing.ExecuteReader();
+            if (reader.Read())
+            {
+                existingId = reader.GetInt64(0);
+                existingProcessName = reader.GetString(1);
+                existingEndUnix = reader.IsDBNull(2) ? null : reader.GetInt64(2);
+            }
+        }
+
+        if (existingId is { } matchedId)
+        {
+            if (existingEndUnix is null && endUnix is { } closingEndUnix)
+            {
+                var duration = Math.Max(closingEndUnix - startUnix, 0);
+                using var close = _conn.CreateCommand();
+                close.Transaction = transaction;
+                close.CommandText = """
+                    UPDATE sessions
+                    SET end_at = $end, duration_sec = $duration
+                    WHERE id = $id AND end_at IS NULL;
+                    """;
+                close.Parameters.AddWithValue("$end", closingEndUnix);
+                close.Parameters.AddWithValue("$duration", duration);
+                close.Parameters.AddWithValue("$id", matchedId);
+                close.ExecuteNonQuery();
+            }
+
+            if (!string.IsNullOrEmpty(exePath))
+                UpsertProcessPathCore(existingProcessName!, exePath, endAt ?? startAt, transaction);
+            return matchedId;
+        }
+
+        using var cmd = _conn.CreateCommand();
+        cmd.Transaction = transaction;
+        if (endUnix is { } importedEndUnix)
+        {
+            var duration = importedEndUnix - startUnix;
             if (duration < 0) duration = 0;
             cmd.CommandText = """
                 INSERT INTO sessions (process_name, start_at, end_at, duration_sec)
@@ -225,7 +384,7 @@ public sealed class SqliteStore : ISessionSink, IDisposable
                 """;
             cmd.Parameters.AddWithValue("$p", processName);
             cmd.Parameters.AddWithValue("$s", startUnix);
-            cmd.Parameters.AddWithValue("$e", endUnix);
+            cmd.Parameters.AddWithValue("$e", importedEndUnix);
             cmd.Parameters.AddWithValue("$d", duration);
         }
         else
@@ -240,7 +399,7 @@ public sealed class SqliteStore : ISessionSink, IDisposable
         id = (long)cmd.ExecuteScalar()!;
 
         if (!string.IsNullOrEmpty(exePath))
-            UpsertProcessPath(processName, exePath, endAt ?? startAt);
+            UpsertProcessPathCore(processName, exePath, endAt ?? startAt, transaction);
 
         return id;
     }
@@ -268,6 +427,240 @@ public sealed class SqliteStore : ISessionSink, IDisposable
         cmd.ExecuteNonQuery();
     }
 
+    /// <summary>Returns all categories in user-defined order.</summary>
+    public IReadOnlyList<ApplicationCategory> ListCategories()
+    {
+        using var cmd = _conn.CreateCommand();
+        cmd.CommandText = "SELECT id, name, color_rgb, sort_order FROM categories ORDER BY sort_order, name COLLATE NOCASE;";
+        var result = new List<ApplicationCategory>();
+        using var r = cmd.ExecuteReader();
+        while (r.Read())
+        {
+            result.Add(new ApplicationCategory(
+                r.GetInt64(0), r.GetString(1), r.GetInt32(2), r.GetInt32(3)));
+        }
+        return result;
+    }
+
+    public ApplicationCategory? GetCategory(long id)
+    {
+        using var cmd = _conn.CreateCommand();
+        cmd.CommandText = "SELECT id, name, color_rgb, sort_order FROM categories WHERE id = $id;";
+        cmd.Parameters.AddWithValue("$id", id);
+        using var r = cmd.ExecuteReader();
+        return r.Read()
+            ? new ApplicationCategory(r.GetInt64(0), r.GetString(1), r.GetInt32(2), r.GetInt32(3))
+            : null;
+    }
+
+    public long CreateCategory(string name, int colorRgb, int sortOrder = 0)
+    {
+        name = ValidateCategoryName(name);
+        ValidateColor(colorRgb, nameof(colorRgb));
+
+        using var cmd = _conn.CreateCommand();
+        cmd.CommandText = """
+            INSERT INTO categories (name, color_rgb, sort_order) VALUES ($n, $c, $s);
+            SELECT last_insert_rowid();
+            """;
+        cmd.Parameters.AddWithValue("$n", name);
+        cmd.Parameters.AddWithValue("$c", colorRgb);
+        cmd.Parameters.AddWithValue("$s", sortOrder);
+        return (long)cmd.ExecuteScalar()!;
+    }
+
+    public bool UpdateCategory(long id, string name, int colorRgb, int sortOrder)
+    {
+        name = ValidateCategoryName(name);
+        ValidateColor(colorRgb, nameof(colorRgb));
+
+        using var cmd = _conn.CreateCommand();
+        if (id == DefaultApplicationCategories.OtherId)
+        {
+            if (!string.Equals(name, "Other", StringComparison.Ordinal))
+                throw new InvalidOperationException("The default Other category cannot be renamed.");
+            cmd.CommandText = """
+                UPDATE categories SET color_rgb = $c, sort_order = $s WHERE id = $id;
+                """;
+        }
+        else
+        {
+            cmd.CommandText = """
+                UPDATE categories SET name = $n, color_rgb = $c, sort_order = $s WHERE id = $id;
+                """;
+            cmd.Parameters.AddWithValue("$n", name);
+        }
+        cmd.Parameters.AddWithValue("$id", id);
+        cmd.Parameters.AddWithValue("$c", colorRgb);
+        cmd.Parameters.AddWithValue("$s", sortOrder);
+        return cmd.ExecuteNonQuery() > 0;
+    }
+
+    /// <summary>Deletes a category. SQLite sets matching application rule category IDs to NULL.</summary>
+    public bool DeleteCategory(long id)
+    {
+        if (id == DefaultApplicationCategories.OtherId)
+            throw new InvalidOperationException("The default Other category cannot be deleted.");
+        using var cmd = _conn.CreateCommand();
+        cmd.CommandText = "DELETE FROM categories WHERE id = $id;";
+        cmd.Parameters.AddWithValue("$id", id);
+        return cmd.ExecuteNonQuery() > 0;
+    }
+
+    public ApplicationRule? GetApplicationRule(string processName)
+    {
+        processName = ValidateProcessName(processName);
+        using var cmd = _conn.CreateCommand();
+        cmd.CommandText = """
+            SELECT process_name, alias, category_id, color_override_rgb, updated_at
+            FROM application_rules WHERE process_name = $n;
+            """;
+        cmd.Parameters.AddWithValue("$n", processName);
+        using var r = cmd.ExecuteReader();
+        return r.Read() ? ReadApplicationRule(r) : null;
+    }
+
+    public IReadOnlyList<ApplicationRule> ListApplicationRules()
+    {
+        using var cmd = _conn.CreateCommand();
+        cmd.CommandText = """
+            SELECT process_name, alias, category_id, color_override_rgb, updated_at
+            FROM application_rules ORDER BY process_name COLLATE NOCASE;
+            """;
+        var result = new List<ApplicationRule>();
+        using var r = cmd.ExecuteReader();
+        while (r.Read()) result.Add(ReadApplicationRule(r));
+        return result;
+    }
+
+    public void UpsertApplicationRule(
+        string processName,
+        string? alias,
+        long? categoryId,
+        int? colorOverrideRgb,
+        DateTimeOffset at)
+    {
+        processName = ValidateProcessName(processName);
+        if (string.Equals(processName, IdleSentinel.Name, StringComparison.OrdinalIgnoreCase))
+            throw new ArgumentException("The idle sentinel cannot have an application rule.", nameof(processName));
+        alias = string.IsNullOrWhiteSpace(alias) ? null : alias.Trim();
+        if (colorOverrideRgb is { } color) ValidateColor(color, nameof(colorOverrideRgb));
+
+        using var cmd = _conn.CreateCommand();
+        cmd.CommandText = """
+            INSERT INTO application_rules
+              (process_name, alias, category_id, color_override_rgb, updated_at)
+            VALUES ($n, $a, $category, $color, $at)
+            ON CONFLICT(process_name) DO UPDATE SET
+              alias = excluded.alias,
+              category_id = excluded.category_id,
+              color_override_rgb = excluded.color_override_rgb,
+              updated_at = excluded.updated_at;
+            """;
+        cmd.Parameters.AddWithValue("$n", processName);
+        cmd.Parameters.AddWithValue("$a", (object?)alias ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("$category", (object?)categoryId ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("$color", (object?)colorOverrideRgb ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("$at", at.ToUnixTimeSeconds());
+        cmd.ExecuteNonQuery();
+    }
+
+    public bool DeleteApplicationRule(string processName)
+    {
+        processName = ValidateProcessName(processName);
+        using var cmd = _conn.CreateCommand();
+        cmd.CommandText = "DELETE FROM application_rules WHERE process_name = $n;";
+        cmd.Parameters.AddWithValue("$n", processName);
+        return cmd.ExecuteNonQuery() > 0;
+    }
+
+    /// <summary>
+    /// Lists applications present in sessions, executable metadata, or saved rules.
+    /// The idle sentinel is intentionally omitted because it is fixed and non-editable.
+    /// </summary>
+    public IReadOnlyList<KnownApplication> ListKnownApplications()
+    {
+        using var cmd = _conn.CreateCommand();
+        cmd.CommandText = """
+            WITH discovered(process_name) AS (
+              SELECT process_name FROM sessions
+              UNION ALL
+              SELECT name FROM processes
+              UNION ALL
+              SELECT process_name FROM application_rules
+            ),
+            known(process_name) AS (
+              SELECT MIN(process_name COLLATE BINARY)
+              FROM discovered
+              WHERE process_name <> $idle COLLATE NOCASE
+              GROUP BY process_name COLLATE NOCASE
+            )
+            SELECT
+              k.process_name,
+              (SELECT p.exe_path
+                 FROM processes p
+                WHERE p.name = k.process_name COLLATE NOCASE
+                ORDER BY (p.exe_path IS NOT NULL) DESC, p.last_seen_at DESC, p.name COLLATE BINARY
+                LIMIT 1) AS exe_path,
+              ar.alias,
+              ar.category_id,
+              COALESCE(c.name, other.name) AS category_name,
+              ar.color_override_rgb,
+              COALESCE(ar.color_override_rgb, c.color_rgb, other.color_rgb) AS resolved_color
+            FROM known k
+            JOIN categories other ON other.id = $otherId
+            LEFT JOIN application_rules ar ON ar.process_name = k.process_name COLLATE NOCASE
+            LEFT JOIN categories c ON c.id = ar.category_id
+            ORDER BY COALESCE(NULLIF(TRIM(ar.alias), ''), k.process_name) COLLATE NOCASE;
+            """;
+        cmd.Parameters.AddWithValue("$idle", IdleSentinel.Name);
+        cmd.Parameters.AddWithValue("$otherId", DefaultApplicationCategories.OtherId);
+
+        var result = new List<KnownApplication>();
+        using var r = cmd.ExecuteReader();
+        while (r.Read())
+        {
+            result.Add(new KnownApplication(
+                ProcessName: r.GetString(0),
+                ExePath: r.IsDBNull(1) ? null : r.GetString(1),
+                Alias: r.IsDBNull(2) ? null : r.GetString(2),
+                CategoryId: r.IsDBNull(3) ? null : r.GetInt64(3),
+                CategoryName: r.GetString(4),
+                ColorOverrideRgb: r.IsDBNull(5) ? null : r.GetInt32(5),
+                ResolvedColorRgb: r.GetInt32(6)));
+        }
+        return result;
+    }
+
+    static ApplicationRule ReadApplicationRule(SqliteDataReader r) => new(
+        ProcessName: r.GetString(0),
+        Alias: r.IsDBNull(1) ? null : r.GetString(1),
+        CategoryId: r.IsDBNull(2) ? null : r.GetInt64(2),
+        ColorOverrideRgb: r.IsDBNull(3) ? null : r.GetInt32(3),
+        UpdatedAt: DateTimeOffset.FromUnixTimeSeconds(r.GetInt64(4)));
+
+    static string ValidateCategoryName(string name)
+    {
+        ArgumentNullException.ThrowIfNull(name);
+        name = name.Trim();
+        if (name.Length == 0) throw new ArgumentException("Category name cannot be empty.", nameof(name));
+        return name;
+    }
+
+    static string ValidateProcessName(string processName)
+    {
+        ArgumentNullException.ThrowIfNull(processName);
+        processName = processName.Trim();
+        if (processName.Length == 0) throw new ArgumentException("Process name cannot be empty.", nameof(processName));
+        return processName;
+    }
+
+    static void ValidateColor(int colorRgb, string parameterName)
+    {
+        if (colorRgb is < 0 or > 0xFFFFFF)
+            throw new ArgumentOutOfRangeException(parameterName, "RGB color must be between 0x000000 and 0xFFFFFF.");
+    }
+
     /// <summary>특정 프로세스의 모든 sessions + processes 메타데이터 삭제. 삭제된 sessions 행 수 반환.</summary>
     public int DeleteSessionsForProcess(string processName)
     {
@@ -276,12 +669,12 @@ public sealed class SqliteStore : ISessionSink, IDisposable
         using (var cmd = _conn.CreateCommand())
         {
             cmd.Transaction = tx;
-            cmd.CommandText = "DELETE FROM sessions WHERE process_name = $n;";
+            cmd.CommandText = "DELETE FROM sessions WHERE process_name = $n COLLATE NOCASE;";
             cmd.Parameters.AddWithValue("$n", processName);
             deleted = cmd.ExecuteNonQuery();
 
             cmd.Parameters.Clear();
-            cmd.CommandText = "DELETE FROM processes WHERE name = $n;";
+            cmd.CommandText = "DELETE FROM processes WHERE name = $n COLLATE NOCASE;";
             cmd.Parameters.AddWithValue("$n", processName);
             cmd.ExecuteNonQuery();
         }
@@ -301,4 +694,11 @@ public readonly record struct SessionRow(
     long StartAtUnix,
     long? EndAtUnix,
     int? DurationSec,
+    string? ExePath);
+
+/// <summary>A validated-at-write session value used by atomic batch imports.</summary>
+public readonly record struct ImportSessionRow(
+    string ProcessName,
+    DateTimeOffset StartAt,
+    DateTimeOffset? EndAt,
     string? ExePath);

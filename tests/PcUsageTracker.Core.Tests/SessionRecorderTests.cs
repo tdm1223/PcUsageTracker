@@ -132,6 +132,24 @@ public class SessionRecorderTests
     }
 
     [Fact]
+    public void maintenance_pause_resume_does_not_retain_or_double_close_old_session_id()
+    {
+        var sink = new FakeSink();
+        var recorder = new SessionRecorder(sink);
+        recorder.Tick("chrome", T(0));
+
+        recorder.Pause(T(1));
+        recorder.CurrentProcessName.Should().BeNull();
+        recorder.Resume();
+        recorder.Tick("chrome", T(2));
+        recorder.Pause(T(3));
+
+        sink.Events.Where(e => e.Kind == "close").Select(e => e.Id).Should().Equal(1, 2);
+        sink.Events.Where(e => e.Kind == "close").Should().OnlyHaveUniqueItems(e => e.Id);
+        recorder.CurrentProcessName.Should().BeNull();
+    }
+
+    [Fact]
     public void process_names_are_case_sensitive()
     {
         // Windows process names differ only in case only in rare cases; Ordinal 매칭.

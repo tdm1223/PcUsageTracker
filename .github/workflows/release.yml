@@ -18,8 +18,17 @@ jobs:
         with:
           dotnet-version: '8.0.x'
 
-      - name: Test
-        run: dotnet test tests/PcUsageTracker.Core.Tests -c Release
+      - name: Validate tag version
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}"
+          if ($tag -notmatch '^v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$') {
+            throw "Release tags must use stable vMAJOR.MINOR.PATCH syntax: $tag"
+          }
+          "RELEASE_VERSION=$($tag.Substring(1))" >> $env:GITHUB_ENV
+
+      - name: Test full solution
+        run: dotnet test PcUsageTracker.sln -c Release -p:Version=${{ env.RELEASE_VERSION }}
 
       - name: Publish single-file
         run: >
@@ -30,6 +39,7 @@ jobs:
           -p:PublishSingleFile=true
           -p:IncludeNativeLibrariesForSelfExtract=true
           -p:DebugType=embedded
+          -p:Version=${{ env.RELEASE_VERSION }}
           -o publish
 
       - name: Rename artifact
