@@ -2,10 +2,11 @@ using PcUsageTracker.Core.Reporting;
 
 namespace PcUsageTracker.App;
 
-internal sealed class TimelineControl : Control
+internal sealed class TimelineControl : Control, IMessageFilter
 {
     const int RasterWidth = 2048;
     static readonly Color TrackBackColor = Color.FromArgb(232, 235, 239);
+    static readonly Color IdleBackColor = Color.FromArgb(204, 210, 217);
 
     readonly ToolTip _toolTip = new();
     IReadOnlyList<TimelinePaintItem> _segments = Array.Empty<TimelinePaintItem>();
@@ -13,9 +14,23 @@ internal sealed class TimelineControl : Control
     int[] _hitIndexes = [];
     Bitmap? _raster;
     TimeZoneInfo _zone = TimeZoneInfo.Local;
+    DateOnly? _day;
+    DateTimeOffset _dayStart;
+    DateTimeOffset _dayEnd;
+    TimelineViewport _viewport = TimelineViewport.FullDay;
     string _summary = "No timeline data loaded.";
     int _hoveredIndex = -1;
     int _focusedIndex = -1;
+    bool _dragging;
+    bool _mousePressed;
+    int _dragStartX;
+    TimelineViewport _dragStartViewport;
+    double? _selectedFraction;
+    string? _highlightProcess;
+
+    public event Action<string?>? ProcessSelected;
+    public event Action<string>? SelectionDetailsChanged;
+    public event Action<string>? VisibleRangeChanged;
 
     public TimelineControl()
     {
@@ -29,14 +44,27 @@ internal sealed class TimelineControl : Control
         TabStop = true;
         AccessibleName = "24 hour usage timeline";
         AccessibleRole = AccessibleRole.Graphic;
+        Application.AddMessageFilter(this);
     }
 
     public void SetData(DateOnly day, TimeZoneInfo zone, IReadOnlyList<TimelineSegment> segments)
     {
         ArgumentNullException.ThrowIfNull(zone);
         ArgumentNullException.ThrowIfNull(segments);
+        if (_day != day || !_zone.Equals(zone))
+        {
+            _dragging = false;
+            _mousePressed = false;
+            Capture = false;
+            _viewport = TimelineViewport.FullDay;
+            _selectedFraction = null;
+            _highlightProcess = null;
+        }
+        _day = day;
         _zone = zone;
         var (dayStart, dayEnd) = Aggregator.DayRange(day, zone);
+        _dayStart = dayStart;
+        _dayEnd = dayEnd;
         var projected = segments
             .Select(segment => new TimelinePaintItem(
                 segment,
@@ -46,22 +74,75 @@ internal sealed class TimelineControl : Control
             .ThenBy(item => item.Coordinates.EndFraction)
             .ToArray();
         _segments = Coalesce(projected);
-        _ticks = TimelineCoordinates.CreateHourTicks(day, zone, dayStart, dayEnd)
-            .Where(tick => tick.LocalHour % 3 == 0 || tick.IsTransition || tick.Fraction is 0d or 1d)
-            .ToArray();
+        _ticks = TimelineCoordinates.CreateHourTicks(day, zone, dayStart, dayEnd);
         BuildRaster();
         var totalSeconds = segments.Sum(segment => (long)segment.TotalSeconds);
         _summary = segments.Count == 0
             ? $"No activity recorded on {day:yyyy-MM-dd}."
             : $"{_segments.Count} visible timeline spans on {day:yyyy-MM-dd}, " +
-              $"totaling {FormatDuration(totalSeconds)}. Applications are colored; idle spans are empty.";
+              $"totaling {FormatDuration(totalSeconds)}. Applications are colored; idle spans are hatched.";
         _hoveredIndex = -1;
         if (_segments.Count == 0) _focusedIndex = -1;
         else if (_focusedIndex >= _segments.Count) _focusedIndex = _segments.Count - 1;
         else if (Focused && _focusedIndex < 0) _focusedIndex = 0;
         UpdateAccessibleItem();
         _toolTip.SetToolTip(this, null);
+        NotifyVisibleRange();
+        NotifySelectionDetails();
         Invalidate();
+    }
+
+    public void HighlightProcess(string? processName)
+    {
+        if (string.Equals(_highlightProcess, processName, StringComparison.OrdinalIgnoreCase)) return;
+        _highlightProcess = processName;
+        BuildRaster();
+        Invalidate();
+    }
+
+    public void ResetView()
+    {
+        _viewport = TimelineViewport.FullDay;
+        _hoveredIndex = -1;
+        _toolTip.SetToolTip(this, null);
+        BuildRaster();
+        NotifyVisibleRange();
+        Invalidate();
+    }
+
+    void NotifyVisibleRange()
+    {
+        if (_day is null) return;
+        string FormatBoundary(double fraction)
+        {
+            if (fraction >= 1) return "24:00";
+            var instant = _dayStart.AddTicks((long)((_dayEnd - _dayStart).Ticks * fraction));
+            var local = TimeZoneInfo.ConvertTime(instant, _zone);
+            return _zone.IsAmbiguousTime(local.DateTime) ? $"{local:HH:mm zzz}" : $"{local:HH:mm}";
+        }
+        VisibleRangeChanged?.Invoke($"{FormatBoundary(_viewport.Start)}–{FormatBoundary(_viewport.End)}");
+    }
+
+    void NotifySelectionDetails()
+    {
+        if (_selectedFraction is not { } fraction)
+        {
+            SelectionDetailsChanged?.Invoke("Click the timeline to inspect a time.");
+            return;
+        }
+        var instant = _dayStart.AddTicks((long)((_dayEnd - _dayStart).Ticks * fraction));
+        var local = TimeZoneInfo.ConvertTime(instant, _zone);
+        var index = FindSegmentAtDayFraction(fraction);
+        if (index < 0)
+        {
+            SelectionDetailsChanged?.Invoke($"Selected {local:HH:mm:ss} · No recorded activity");
+            return;
+        }
+        var segment = _segments[index].Segment;
+        var start = TimeZoneInfo.ConvertTime(segment.StartAt, _zone);
+        var end = TimeZoneInfo.ConvertTime(segment.EndAt, _zone);
+        SelectionDetailsChanged?.Invoke($"Selected {local:HH:mm:ss} · {segment.DisplayName} · " +
+            $"{start:HH:mm:ss}–{end:HH:mm:ss} · {FormatDuration(segment.TotalSeconds)}");
     }
 
     protected override void OnPaint(PaintEventArgs e)
@@ -86,9 +167,31 @@ internal sealed class TimelineControl : Control
         if (_raster is not null)
         {
             var previousMode = e.Graphics.InterpolationMode;
+            var previousPixelOffset = e.Graphics.PixelOffsetMode;
             e.Graphics.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.NearestNeighbor;
+            // A one-pixel-high raster needs centered sampling when stretched vertically.
+            e.Graphics.PixelOffsetMode = System.Drawing.Drawing2D.PixelOffsetMode.Half;
             e.Graphics.DrawImage(_raster, track);
             e.Graphics.InterpolationMode = previousMode;
+            e.Graphics.PixelOffsetMode = previousPixelOffset;
+        }
+
+        using (var hatch = new System.Drawing.Drawing2D.HatchBrush(
+                   System.Drawing.Drawing2D.HatchStyle.ForwardDiagonal, Color.FromArgb(145, 153, 162), IdleBackColor))
+        {
+            for (var pixel = 0; pixel < _hitIndexes.Length;)
+            {
+                var index = _hitIndexes[pixel];
+                var end = pixel + 1;
+                while (end < _hitIndexes.Length && _hitIndexes[end] == index) end++;
+                if (index >= 0 && _segments[index].Segment.IsIdle)
+                {
+                    var x1 = track.Left + track.Width * pixel / _hitIndexes.Length;
+                    var x2 = track.Left + (int)Math.Ceiling(track.Width * end / (double)_hitIndexes.Length);
+                    e.Graphics.FillRectangle(hatch, x1, track.Top, Math.Max(1, x2 - x1), track.Height);
+                }
+                pixel = end;
+            }
         }
 
         if (_segments.Count == 0)
@@ -105,9 +208,9 @@ internal sealed class TimelineControl : Control
 
         using var tickPen = new Pen(SystemColors.ControlDark);
         TimelineHourTick? previousTick = null;
-        foreach (var tick in _ticks)
+        foreach (var tick in VisibleTicks())
         {
-            var x = track.Left + (int)Math.Round(track.Width * tick.Fraction);
+            var x = track.Left + (int)Math.Round(track.Width * (tick.Fraction - _viewport.Start) / _viewport.Width);
             e.Graphics.DrawLine(tickPen, x, track.Bottom, x, track.Bottom + (int)Math.Round(3 * scale));
             var label = tick.Label;
             var width = TextRenderer.MeasureText(label, Font).Width;
@@ -128,10 +231,36 @@ internal sealed class TimelineControl : Control
         if (Focused && _focusedIndex >= 0 && _focusedIndex < _segments.Count)
         {
             var focused = _segments[_focusedIndex].Coordinates;
-            var x1 = track.Left + (int)Math.Floor(track.Width * focused.StartFraction);
-            var x2 = track.Left + (int)Math.Ceiling(track.Width * focused.EndFraction);
-            ControlPaint.DrawFocusRectangle(e.Graphics,
-                Rectangle.FromLTRB(x1, track.Top, Math.Max(x1 + 2, x2), track.Bottom));
+            if (focused.EndFraction >= _viewport.Start && focused.StartFraction <= _viewport.End)
+            {
+                var x1 = track.Left + (int)Math.Floor(track.Width * Math.Max(0, (focused.StartFraction - _viewport.Start) / _viewport.Width));
+                var x2 = track.Left + (int)Math.Ceiling(track.Width * Math.Min(1, (focused.EndFraction - _viewport.Start) / _viewport.Width));
+                ControlPaint.DrawFocusRectangle(e.Graphics,
+                    Rectangle.FromLTRB(x1, track.Top, Math.Max(x1 + 2, x2), track.Bottom));
+            }
+        }
+
+        if (_selectedFraction is { } selected && selected >= _viewport.Start && selected <= _viewport.End)
+        {
+            var x = Math.Clamp(track.Left + (int)Math.Round(track.Width * (selected - _viewport.Start) / _viewport.Width), track.Left, track.Right - 1);
+            using var outline = new Pen(Color.White, Math.Max(3, 3 * scale));
+            using var line = new Pen(Color.FromArgb(32, 38, 48), Math.Max(1, scale));
+            e.Graphics.DrawLine(outline, x, track.Top, x, track.Bottom - 1);
+            e.Graphics.DrawLine(line, x, track.Top, x, track.Bottom - 1);
+
+            var instant = _dayStart.AddTicks((long)((_dayEnd - _dayStart).Ticks * selected));
+            var local = TimeZoneInfo.ConvertTime(instant, _zone);
+            var index = FindSegmentAtDayFraction(selected);
+            var name = index < 0 ? "No activity" : _segments[index].Segment.DisplayName;
+            var text = $"{local:HH:mm:ss}  {name}";
+            var boxWidth = Math.Min(track.Width, TextRenderer.MeasureText(text, Font).Width + (int)(10 * scale));
+            var boxHeight = Math.Min(track.Height, Font.Height + (int)(6 * scale));
+            var boxX = Math.Clamp(x + (int)(5 * scale), track.Left, Math.Max(track.Left, track.Right - boxWidth));
+            var box = new Rectangle(boxX, track.Top, boxWidth, boxHeight);
+            using var background = new SolidBrush(Color.FromArgb(245, 255, 255, 255));
+            e.Graphics.FillRectangle(background, box);
+            TextRenderer.DrawText(e.Graphics, text, Font, box, Color.FromArgb(32, 38, 48),
+                TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine | TextFormatFlags.EndEllipsis);
         }
 
         if (Focused) ControlPaint.DrawFocusRectangle(e.Graphics, ClientRectangle);
@@ -140,6 +269,25 @@ internal sealed class TimelineControl : Control
     protected override void OnMouseMove(MouseEventArgs e)
     {
         base.OnMouseMove(e);
+        if (_mousePressed && !_dragging && _dragStartViewport.Width < 1 &&
+            Math.Abs(e.X - _dragStartX) >= Math.Max(1, SystemInformation.DragSize.Width / 2))
+            _dragging = true;
+        if (_dragging)
+        {
+            var trackWidth = Math.Max(1d, ClientSize.Width - 20d * DeviceDpi / 96d);
+            var offset = -((e.X - _dragStartX) / trackWidth) * _dragStartViewport.Width;
+            var next = _dragStartViewport.Pan(offset);
+            if (next != _viewport)
+            {
+                _viewport = next;
+                _hoveredIndex = -1;
+                _toolTip.SetToolTip(this, null);
+                BuildRaster();
+                NotifyVisibleRange();
+                Invalidate();
+            }
+            return;
+        }
         var fraction = ClientSize.Width <= 20
             ? -1
             : Math.Clamp((e.X - 10d * DeviceDpi / 96d) /
@@ -166,13 +314,50 @@ internal sealed class TimelineControl : Control
     protected override void OnMouseDown(MouseEventArgs e)
     {
         Focus();
-        if (_hoveredIndex >= 0)
+        if (e.Button == MouseButtons.Left && _day is not null)
         {
-            _focusedIndex = _hoveredIndex;
-            UpdateAccessibleItem();
-            Invalidate();
+            _mousePressed = true;
+            _dragging = false;
+            _dragStartX = e.X;
+            _dragStartViewport = _viewport;
+            Capture = true;
+            _toolTip.SetToolTip(this, null);
         }
         base.OnMouseDown(e);
+    }
+
+    protected override void OnMouseUp(MouseEventArgs e)
+    {
+        if (e.Button == MouseButtons.Left && _mousePressed)
+        {
+            if (!_dragging && ClientRectangle.Contains(e.Location))
+            {
+                var margin = 10d * DeviceDpi / 96d;
+                var position = Math.Clamp((e.X - margin) / Math.Max(1, ClientSize.Width - 2 * margin), 0, 1);
+                _selectedFraction = _viewport.Start + position * _viewport.Width;
+                _focusedIndex = FindSegmentAtDayFraction(_selectedFraction.Value);
+                UpdateAccessibleItem();
+                var process = _focusedIndex >= 0 ? _segments[_focusedIndex].Segment.ProcessName : null;
+                HighlightProcess(process);
+                ProcessSelected?.Invoke(process);
+                NotifySelectionDetails();
+                Invalidate();
+            }
+            _dragging = false;
+            _mousePressed = false;
+            Capture = false;
+        }
+        base.OnMouseUp(e);
+    }
+
+    protected override void OnMouseCaptureChanged(EventArgs e)
+    {
+        if (!Capture)
+        {
+            _dragging = false;
+            _mousePressed = false;
+        }
+        base.OnMouseCaptureChanged(e);
     }
 
     protected override void OnMouseLeave(EventArgs e)
@@ -182,11 +367,68 @@ internal sealed class TimelineControl : Control
         _toolTip.SetToolTip(this, null);
     }
 
+    public bool PreFilterMessage(ref Message m)
+    {
+        const int mouseWheel = 0x020A;
+        if (m.Msg != mouseWheel || !Visible || IsDisposed || FindForm() != Form.ActiveForm ||
+            !RectangleToScreen(ClientRectangle).Contains(Cursor.Position) || _day is null)
+            return false;
+
+        var delta = unchecked((short)((m.WParam.ToInt64() >> 16) & 0xffff));
+        if (delta == 0) return false;
+        var x = PointToClient(Cursor.Position).X;
+        var margin = 10d * DeviceDpi / 96d;
+        var anchor = Math.Clamp((x - margin) / Math.Max(1, ClientSize.Width - 2 * margin), 0, 1);
+        var minWidth = Math.Min(1, TimeSpan.FromMinutes(15).Ticks / (double)(_dayEnd - _dayStart).Ticks);
+        _viewport = _viewport.Zoom(anchor, Math.Pow(0.8, delta / 120d), minWidth);
+        _hoveredIndex = -1;
+        _toolTip.SetToolTip(this, null);
+        BuildRaster();
+        NotifyVisibleRange();
+        Invalidate();
+        return true;
+    }
+
+    IEnumerable<TimelineHourTick> VisibleTicks()
+    {
+        var minutes = (_dayEnd - _dayStart).TotalMinutes * _viewport.Width;
+        if (minutes >= 180)
+        {
+            var step = minutes > 720 ? 3 : 1;
+            return _ticks.Where(tick => tick.Fraction >= _viewport.Start && tick.Fraction <= _viewport.End &&
+                (tick.LocalHour % step == 0 || tick.IsTransition || tick.Fraction is 0d or 1d));
+        }
+
+        var interval = minutes > 90 ? 30 : minutes > 45 ? 15 : minutes > 20 ? 5 : 2;
+        var ticks = new List<TimelineHourTick>();
+        var startMinute = (int)Math.Ceiling((_dayEnd - _dayStart).TotalMinutes * _viewport.Start / interval) * interval;
+        for (var minute = startMinute; minute <= (_dayEnd - _dayStart).TotalMinutes * _viewport.End; minute += interval)
+        {
+            var instant = _dayStart.AddMinutes(minute);
+            var local = TimeZoneInfo.ConvertTime(instant, _zone);
+            var ambiguous = _zone.IsAmbiguousTime(local.DateTime);
+            var label = ambiguous ? $"{local:HH:mm zzz}" : $"{local:HH:mm}";
+            ticks.Add(new TimelineHourTick(instant, minute / (_dayEnd - _dayStart).TotalMinutes,
+                label, local.Hour, ambiguous, false));
+        }
+        return ticks;
+    }
+
     int FindIndexAtFraction(double fraction)
     {
         if (_hitIndexes.Length == 0) return -1;
         var pixel = Math.Clamp((int)Math.Floor(fraction * _hitIndexes.Length), 0, _hitIndexes.Length - 1);
         return _hitIndexes[pixel];
+    }
+
+    int FindSegmentAtDayFraction(double fraction)
+    {
+        for (var index = _segments.Count - 1; index >= 0; index--)
+        {
+            var coordinates = _segments[index].Coordinates;
+            if (coordinates.StartFraction <= fraction && fraction < coordinates.EndFraction) return index;
+        }
+        return -1;
     }
 
     protected override void OnKeyDown(KeyEventArgs e)
@@ -212,6 +454,14 @@ internal sealed class TimelineControl : Control
         }
 
         _focusedIndex = next;
+        var coordinates = _segments[next].Coordinates;
+        var revealed = _viewport.Reveal((coordinates.StartFraction + coordinates.EndFraction) / 2);
+        if (revealed != _viewport)
+        {
+            _viewport = revealed;
+            BuildRaster();
+            NotifyVisibleRange();
+        }
         UpdateAccessibleItem();
         Invalidate();
         e.Handled = true;
@@ -241,7 +491,7 @@ internal sealed class TimelineControl : Control
         AccessibleDescription =
             $"{segment.CategoryName ?? (segment.IsIdle ? "Idle" : "Other")}, " +
             $"{start:HH:mm:ss zzz} to {end:HH:mm:ss zzz}, {FormatDuration(segment.TotalSeconds)}. " +
-            "Use the arrow keys to move between spans.";
+            "Use the arrow keys to move between spans. Use the mouse wheel to zoom and drag to pan.";
         AccessibilityNotifyClients(AccessibleEvents.NameChange, -1);
         AccessibilityNotifyClients(AccessibleEvents.DescriptionChange, -1);
     }
@@ -291,13 +541,25 @@ internal sealed class TimelineControl : Control
         for (var index = 0; index < _segments.Count; index++)
         {
             var item = _segments[index];
+            if (item.Coordinates.EndFraction <= _viewport.Start || item.Coordinates.StartFraction >= _viewport.End)
+                continue;
             var start = Math.Clamp(
-                (int)Math.Floor(item.Coordinates.StartFraction * RasterWidth), 0, RasterWidth - 1);
+                (int)Math.Floor((item.Coordinates.StartFraction - _viewport.Start) / _viewport.Width * RasterWidth), 0, RasterWidth - 1);
             var endExclusive = Math.Clamp(
-                (int)Math.Ceiling(item.Coordinates.EndFraction * RasterWidth), start + 1, RasterWidth);
+                (int)Math.Ceiling((item.Coordinates.EndFraction - _viewport.Start) / _viewport.Width * RasterWidth), start + 1, RasterWidth);
             if (!item.Segment.IsIdle)
             {
-                brush.Color = ColorFromRgb(item.Segment.ColorRgb);
+                var color = ColorFromRgb(item.Segment.ColorRgb);
+                if (_highlightProcess is not null && !string.Equals(
+                        item.Segment.ProcessName, _highlightProcess, StringComparison.OrdinalIgnoreCase))
+                    color = Color.FromArgb((color.R + 3 * TrackBackColor.R) / 4,
+                        (color.G + 3 * TrackBackColor.G) / 4, (color.B + 3 * TrackBackColor.B) / 4);
+                brush.Color = color;
+                graphics.FillRectangle(brush, start, 0, endExclusive - start, 1);
+            }
+            else
+            {
+                brush.Color = IdleBackColor;
                 graphics.FillRectangle(brush, start, 0, endExclusive - start, 1);
             }
             Array.Fill(_hitIndexes, index, start, endExclusive - start);
@@ -323,6 +585,7 @@ internal sealed class TimelineControl : Control
     {
         if (disposing)
         {
+            Application.RemoveMessageFilter(this);
             _toolTip.Dispose();
             _raster?.Dispose();
         }
@@ -357,6 +620,8 @@ internal sealed class DailyUsageChartControl : Control
     int _hoveredIndex = -1;
     int _focusedIndex = -1;
     string _summary = "No daily usage data loaded.";
+
+    public event Action<DateOnly>? DaySelected;
 
     public DailyUsageChartControl()
     {
@@ -509,11 +774,18 @@ internal sealed class DailyUsageChartControl : Control
     protected override void OnMouseDown(MouseEventArgs e)
     {
         Focus();
-        if (_hoveredIndex >= 0)
+        var scale = DeviceDpi / 96f;
+        var left = 42 * scale;
+        var right = ClientSize.Width - 8 * scale;
+        var top = 12 * scale;
+        var bottom = ClientSize.Height - 32 * scale;
+        if (e.Button == MouseButtons.Left && _points.Count > 0 && right > left &&
+            e.X >= left && e.X < right && e.Y >= top && e.Y <= bottom)
         {
-            _focusedIndex = _hoveredIndex;
+            _focusedIndex = Math.Clamp((int)((e.X - left) / ((right - left) / _points.Count)), 0, _points.Count - 1);
             UpdateAccessibleItem();
             Invalidate();
+            DaySelected?.Invoke(_points[_focusedIndex].Date);
         }
         base.OnMouseDown(e);
     }
@@ -523,6 +795,14 @@ internal sealed class DailyUsageChartControl : Control
         if (_points.Count == 0)
         {
             base.OnKeyDown(e);
+            return;
+        }
+
+        if (e.KeyCode is Keys.Enter or Keys.Space && _focusedIndex >= 0 && _focusedIndex < _points.Count)
+        {
+            DaySelected?.Invoke(_points[_focusedIndex].Date);
+            e.Handled = true;
+            e.SuppressKeyPress = true;
             return;
         }
 
@@ -567,7 +847,7 @@ internal sealed class DailyUsageChartControl : Control
         AccessibleName = $"Day {_focusedIndex + 1} of {_points.Count}: {point.Date:yyyy-MM-dd}";
         AccessibleDescription =
             $"Active {FormatDuration(point.ActiveSeconds)}, idle {FormatDuration(point.IdleSeconds)}, " +
-            $"total {FormatDuration(point.TotalSeconds)}. Use the arrow keys to move between days.";
+            $"total {FormatDuration(point.TotalSeconds)}. Use the arrow keys to move between days and Enter to select.";
         AccessibilityNotifyClients(AccessibleEvents.NameChange, -1);
         AccessibilityNotifyClients(AccessibleEvents.DescriptionChange, -1);
     }

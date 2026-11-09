@@ -32,6 +32,9 @@ internal sealed class ReportForm : Form
     readonly Label _idleValue;
     readonly Label _topApplicationValue;
     readonly TimelineControl _timeline;
+    readonly Label _timelineRange;
+    readonly Label _timelineDetails;
+    readonly FlowLayoutPanel _categoryLegend;
     readonly DailyUsageChartControl _dailyChart;
     readonly ComboBox _dailyRange;
     readonly DataGridView _dashboardGrid;
@@ -60,6 +63,9 @@ internal sealed class ReportForm : Form
     volatile bool _disposing;
     bool _suppressDashboardDateChange;
     bool _iconDrainScheduled;
+    string? _highlightedProcess;
+    DateOnly? _dashboardAppliedDay;
+    string? _legendSignature;
 
     public ReportForm(IClock clock, SqliteStore store, Action onExclusionChanged)
     {
@@ -125,6 +131,30 @@ internal sealed class ReportForm : Form
         cards.Controls.Add(BuildMetricCard("Top application", out _topApplicationValue), 3, 0);
 
         _timeline = new TimelineControl { Dock = DockStyle.Fill };
+        _timelineRange = new Label
+        {
+            Text = "00:00–24:00", AutoSize = true, Anchor = AnchorStyles.Left,
+        };
+        _timelineDetails = new Label
+        {
+            Text = "Click the timeline to inspect a time.", Dock = DockStyle.Fill,
+            Padding = new Padding(10, 0, 0, 0), AutoEllipsis = true,
+            TextAlign = ContentAlignment.MiddleLeft,
+        };
+        _categoryLegend = new FlowLayoutPanel
+        {
+            Dock = DockStyle.Fill, FlowDirection = FlowDirection.LeftToRight, WrapContents = false,
+            AutoScroll = true, Padding = new Padding(8, 0, 0, 0),
+        };
+        var resetTimeline = new Button { Text = "Full day", AutoSize = true, Height = 25 };
+        resetTimeline.Click += (_, _) => _timeline.ResetView();
+        var timelineHeader = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 3, RowCount = 1 };
+        timelineHeader.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        timelineHeader.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+        timelineHeader.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+        timelineHeader.Controls.Add(BuildSectionHeader("24-hour timeline · Wheel to zoom, drag to move"), 0, 0);
+        timelineHeader.Controls.Add(_timelineRange, 1, 0);
+        timelineHeader.Controls.Add(resetTimeline, 2, 0);
         _dailyChart = new DailyUsageChartControl { Dock = DockStyle.Fill };
         _dailyRange = new ComboBox
         {
@@ -152,19 +182,35 @@ internal sealed class ReportForm : Form
         {
             Dock = DockStyle.Fill,
             ColumnCount = 1,
-            RowCount = 5,
+            RowCount = 7,
         };
         dashboardLayout.RowStyles.Add(new RowStyle(SizeType.Absolute, 40));
         dashboardLayout.RowStyles.Add(new RowStyle(SizeType.Absolute, 80));
-        dashboardLayout.RowStyles.Add(new RowStyle(SizeType.Absolute, 26));
+        dashboardLayout.RowStyles.Add(new RowStyle(SizeType.Absolute, 32));
         dashboardLayout.RowStyles.Add(new RowStyle(SizeType.Absolute, 105));
+        dashboardLayout.RowStyles.Add(new RowStyle(SizeType.Absolute, 27));
+        dashboardLayout.RowStyles.Add(new RowStyle(SizeType.Absolute, 38));
         dashboardLayout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
         dashboardLayout.Controls.Add(dashboardToolbar, 0, 0);
         dashboardLayout.Controls.Add(cards, 0, 1);
-        dashboardLayout.Controls.Add(BuildSectionHeader("24-hour timeline"), 0, 2);
+        dashboardLayout.Controls.Add(timelineHeader, 0, 2);
         dashboardLayout.Controls.Add(_timeline, 0, 3);
-        dashboardLayout.Controls.Add(lower, 0, 4);
+        dashboardLayout.Controls.Add(_timelineDetails, 0, 4);
+        dashboardLayout.Controls.Add(_categoryLegend, 0, 5);
+        dashboardLayout.Controls.Add(lower, 0, 6);
         _dashboardTab.Controls.Add(dashboardLayout);
+
+        _timeline.VisibleRangeChanged += value => _timelineRange.Text = value;
+        _timeline.SelectionDetailsChanged += value => _timelineDetails.Text = value;
+        _timeline.ProcessSelected += SelectDashboardProcess;
+        _dashboardGrid.CellClick += (_, e) =>
+        {
+            if (e.RowIndex < 0 || _dashboardGrid.Rows[e.RowIndex].Tag is not ReportEntry entry) return;
+            _highlightedProcess = string.Equals(_highlightedProcess, entry.ProcessName, StringComparison.OrdinalIgnoreCase)
+                ? null : entry.ProcessName;
+            _timeline.HighlightProcess(_highlightedProcess);
+        };
+        _dailyChart.DaySelected += SetDashboardDate;
 
         _overviewTab = new TabPage("Today + Week + Month");
         var split = new TableLayoutPanel
@@ -583,7 +629,8 @@ internal sealed class ReportForm : Form
             DashboardSummary.FromApplications(applications),
             applications,
             aggregator.Timeline(request.Day, request.Now, zone),
-            aggregator.DailyTotals(request.Day, request.DayCount, request.Now, zone));
+            aggregator.DailyTotals(request.Day, request.DayCount, request.Now, zone),
+            aggregator.CategoryTotals(request.Day, request.Now, zone));
     }
 
     void ApplyReportData(ReportRefreshRequest request, ReportData data)
@@ -591,6 +638,12 @@ internal sealed class ReportForm : Form
         switch (data)
         {
             case DashboardReportData dashboard:
+                var dateChanged = _dashboardAppliedDay != request.Day;
+                if (dateChanged)
+                {
+                    _dashboardAppliedDay = request.Day;
+                    _highlightedProcess = null;
+                }
                 SetLabelText(_totalValue, FormatDuration(dashboard.Summary.TotalSeconds));
                 SetLabelText(_activeValue, FormatDuration(dashboard.Summary.ActiveSeconds));
                 SetLabelText(_idleValue, FormatDuration(dashboard.Summary.IdleSeconds));
@@ -601,6 +654,8 @@ internal sealed class ReportForm : Form
                 _timeline.SetData(request.Day, TimeZoneInfo.Local, dashboard.Timeline);
                 _dailyChart.SetData(dashboard.Daily);
                 Populate(_dashboardGrid, dashboard.Applications);
+                if (dateChanged) _dashboardGrid.ClearSelection();
+                UpdateCategoryLegend(dashboard.Categories);
                 UpdateDashboardDateNavigation(request.Now);
                 if (request.Day != _lastKnownToday)
                 {
@@ -787,6 +842,52 @@ internal sealed class ReportForm : Form
             IndexRows(grid);
             grid.ResumeLayout();
         }
+    }
+
+    void SelectDashboardProcess(string? processName)
+    {
+        _highlightedProcess = processName;
+        _dashboardGrid.ClearSelection();
+        if (processName is null) return;
+        var row = _dashboardGrid.Rows.Cast<DataGridViewRow>().FirstOrDefault(item =>
+            string.Equals(GetProcessName(item), processName, StringComparison.OrdinalIgnoreCase));
+        if (row is null) return;
+        row.Selected = true;
+        if (row.Visible) _dashboardGrid.FirstDisplayedScrollingRowIndex = row.Index;
+    }
+
+    void UpdateCategoryLegend(IReadOnlyList<CategoryUsage> categories)
+    {
+        var total = categories.Sum(category => (long)category.TotalSeconds);
+        var signature = string.Join("|", categories.Select(c =>
+            $"{c.CategoryName}:{c.TotalSeconds}:{c.ColorRgb}:{c.IsIdle}"));
+        if (signature == _legendSignature) return;
+        _legendSignature = signature;
+        while (_categoryLegend.Controls.Count > 0)
+            _categoryLegend.Controls[0].Dispose();
+
+        void AddText(string text, Color? swatch = null)
+        {
+            if (swatch is { } color)
+                _categoryLegend.Controls.Add(new Label
+                {
+                    AutoSize = false, Size = new Size(12, 12), BackColor = color,
+                    Margin = new Padding(5, 5, 2, 0), AccessibleName = text,
+                });
+            _categoryLegend.Controls.Add(new Label
+            {
+                Text = text, AutoSize = true, Margin = new Padding(0, 3, 8, 0),
+            });
+        }
+
+        AddText("Tracked share:");
+        foreach (var category in categories.Where(item => !item.IsIdle))
+            AddText($"{category.DisplayName} {(total > 0 ? category.TotalSeconds * 100d / total : 0):0.#}%",
+                ColorFromRgb(category.ColorRgb));
+        var idle = categories.FirstOrDefault(item => item.IsIdle);
+        AddText($"▧ Idle {(total > 0 ? idle.TotalSeconds * 100d / total : 0):0.#}%");
+        AddText("□ No record");
+        AddText("App-specific colors may differ");
     }
 
     void IndexRows(DataGridView grid)
@@ -1083,7 +1184,8 @@ internal sealed class ReportForm : Form
         DashboardSummary Summary,
         IReadOnlyList<ReportEntry> Applications,
         IReadOnlyList<TimelineSegment> Timeline,
-        IReadOnlyList<DailyUsagePoint> Daily) : ReportData;
+        IReadOnlyList<DailyUsagePoint> Daily,
+        IReadOnlyList<CategoryUsage> Categories) : ReportData;
 
     sealed record OverviewReportData(
         IReadOnlyList<ReportEntry> Today,

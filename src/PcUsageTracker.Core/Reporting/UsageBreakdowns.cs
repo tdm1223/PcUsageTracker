@@ -131,6 +131,35 @@ public readonly record struct TimelineHourTick(
     bool IsTransition,
     bool FollowsSkippedHour);
 
+/// <summary>A visible part of a day, expressed as fractions of its actual duration.</summary>
+public readonly record struct TimelineViewport(double Start, double End)
+{
+    public static TimelineViewport FullDay => new(0, 1);
+    public double Width => End - Start;
+
+    public TimelineViewport Zoom(double anchor, double factor, double minimumWidth)
+    {
+        anchor = Math.Clamp(anchor, 0, 1);
+        var width = Math.Clamp(Width * factor, minimumWidth, 1);
+        var point = Start + Width * anchor;
+        var start = Math.Clamp(point - width * anchor, 0, 1 - width);
+        return new TimelineViewport(start, start + width);
+    }
+
+    public TimelineViewport Reveal(double fraction)
+    {
+        if (fraction >= Start && fraction <= End) return this;
+        var start = Math.Clamp(fraction - Width / 2, 0, 1 - Width);
+        return new TimelineViewport(start, start + Width);
+    }
+
+    public TimelineViewport Pan(double offset)
+    {
+        var start = Math.Clamp(Start + offset, 0, 1 - Width);
+        return new TimelineViewport(start, start + Width);
+    }
+}
+
 /// <summary>Usage totals for one local calendar day. Empty days are represented by zeroes.</summary>
 public readonly record struct DailyUsagePoint(
     DateOnly Date,
