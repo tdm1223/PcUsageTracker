@@ -37,6 +37,7 @@ internal sealed class TrayContext : ApplicationContext
     bool _lastIdleState;
     bool _updateCheckInProgress;
     bool _exitingForUpdate;
+    bool _disposed;
     ReportForm? _reportForm;
     ToolStripMenuItem? _autostartMenuItem;
     ToolStripMenuItem? _checkForUpdatesMenuItem;
@@ -601,6 +602,8 @@ internal sealed class TrayContext : ApplicationContext
     {
         if (disposing)
         {
+            if (_disposed) return;
+            _disposed = true;
             _timer.Stop();
             _timer.Dispose();
             _automaticUpdateTimer.Stop();

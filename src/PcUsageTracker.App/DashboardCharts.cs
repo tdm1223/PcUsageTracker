@@ -198,7 +198,7 @@ internal sealed class TimelineControl : Control, IMessageFilter
         {
             TextRenderer.DrawText(
                 e.Graphics,
-                "No activity recorded",
+                _day is null ? "Loading timeline..." : "No activity recorded",
                 Font,
                 track,
                 SystemColors.GrayText,
@@ -391,6 +391,9 @@ internal sealed class TimelineControl : Control, IMessageFilter
 
     IEnumerable<TimelineHourTick> VisibleTicks()
     {
+        if (_day is null || _dayEnd <= _dayStart)
+            return Array.Empty<TimelineHourTick>();
+
         var minutes = (_dayEnd - _dayStart).TotalMinutes * _viewport.Width;
         if (minutes >= 180)
         {
