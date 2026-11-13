@@ -135,6 +135,8 @@ internal sealed class TrayContext : ApplicationContext
 
         menu.Items.Add("Export to Excel...", image: null, OnExportExcel);
         menu.Items.Add("Import from Excel...", image: null, OnImportExcel);
+        menu.Items.Add("Back up all data...", image: null, OnBackup);
+        menu.Items.Add("Restore full backup...", image: null, OnRestore);
         menu.Items.Add(new ToolStripSeparator());
 
         menu.Items.Add("Idle threshold...", image: null, OnIdleSettings);
@@ -183,6 +185,79 @@ internal sealed class TrayContext : ApplicationContext
             MessageBox.Show($"Export failed:\n\n{ex.Message}", "Error",
                 MessageBoxButtons.OK, MessageBoxIcon.Error);
         }
+    }
+
+    void OnBackup(object? sender, EventArgs e)
+    {
+        using var dialog = new SaveFileDialog
+        {
+            Title = "Back up all data", Filter = "PcUsageTracker backup (*.pcutbackup)|*.pcutbackup",
+            FileName = $"pc-usage-backup-{DateTimeOffset.Now:yyyyMMdd-HHmmss}.pcutbackup",
+            OverwritePrompt = true,
+        };
+        if (dialog.ShowDialog() != DialogResult.OK) return;
+        try
+        {
+            FullBackup.Export(_store, Path.Combine(GetDataFolder(), "icons"), dialog.FileName);
+            MessageBox.Show($"Backup saved:\n\n{dialog.FileName}", "Backup complete");
+        }
+        catch (Exception ex)
+        {
+            Log.Error(ex, "Full backup failed");
+            MessageBox.Show($"Backup failed:\n\n{ex.Message}", "Backup error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
+    }
+
+    void OnRestore(object? sender, EventArgs e)
+    {
+        using var dialog = new OpenFileDialog
+        {
+            Title = "Restore full backup", Filter = "PcUsageTracker backup (*.pcutbackup)|*.pcutbackup",
+            CheckFileExists = true,
+        };
+        if (dialog.ShowDialog() != DialogResult.OK) return;
+        if (MessageBox.Show("Restore this backup? Current history, categories, exclusions, and settings will be replaced. " +
+                            "A backup of the current data will be saved first.", "Confirm restore",
+                MessageBoxButtons.YesNo, MessageBoxIcon.Warning, MessageBoxDefaultButton.Button2) != DialogResult.Yes) return;
+        var paused = false;
+        string? success = null;
+        Exception? failure = null;
+        try
+        {
+            _reportForm?.Dispose();
+            _reportForm = null;
+            if (!_recorder.IsPaused)
+            {
+                _recorder.Pause(_clock.UtcNow);
+                paused = true;
+            }
+            var iconDir = Path.Combine(GetDataFolder(), "icons");
+            var safetyDir = Path.Combine(GetDataFolder(), "backups");
+            var safetyPath = Path.Combine(safetyDir, $"before-restore-{DateTimeOffset.Now:yyyyMMdd-HHmmss}-{Guid.NewGuid():N}.pcutbackup");
+            FullBackup.Export(_store, iconDir, safetyPath);
+            var iconFailures = FullBackup.Restore(_store, iconDir, dialog.FileName, _clock.UtcNow);
+            RefreshExclusions();
+            _idleDetector.SetThreshold(TimeSpan.FromSeconds(LoadIdleThresholdSec()));
+            var iconNote = iconFailures == 0 ? "" : $"\n{iconFailures} cached icons could not be restored.";
+            success = $"Data restored. Previous data was backed up to:\n{safetyPath}{iconNote}";
+        }
+        catch (Exception ex)
+        {
+            Log.Error(ex, "Full restore failed");
+            failure = ex;
+        }
+        finally
+        {
+            if (paused)
+            {
+                _recorder.Resume();
+                OnTick(this, EventArgs.Empty);
+            }
+        }
+        if (failure is not null)
+            MessageBox.Show($"Restore failed:\n\n{failure.Message}", "Restore error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+        else
+            MessageBox.Show(success!, "Restore complete");
     }
 
     void OnImportExcel(object? sender, EventArgs e)

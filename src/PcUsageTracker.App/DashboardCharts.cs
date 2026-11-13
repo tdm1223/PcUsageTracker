@@ -623,6 +623,8 @@ internal sealed class DailyUsageChartControl : Control
     int _hoveredIndex = -1;
     int _focusedIndex = -1;
     string _summary = "No daily usage data loaded.";
+    int _selectedIndex = -1;
+    DateOnly? _latestSelectableDay;
 
     public event Action<DateOnly>? DaySelected;
 
@@ -640,10 +642,13 @@ internal sealed class DailyUsageChartControl : Control
         AccessibleRole = AccessibleRole.Graphic;
     }
 
-    public void SetData(IReadOnlyList<DailyUsagePoint> points)
+    public void SetData(IReadOnlyList<DailyUsagePoint> points, DateOnly? selectedDay = null, DateOnly? latestSelectableDay = null)
     {
         ArgumentNullException.ThrowIfNull(points);
         _points = points;
+        _latestSelectableDay = latestSelectableDay;
+        _selectedIndex = selectedDay is null ? -1 :
+            Enumerable.Range(0, points.Count).FirstOrDefault(index => points[index].Date == selectedDay.Value, -1);
         _maxSeconds = points.Count == 0 ? 0 : points.Max(point => point.TotalSeconds);
         var active = points.Sum(point => (long)point.ActiveSeconds);
         var idle = points.Sum(point => (long)point.IdleSeconds);
@@ -678,6 +683,18 @@ internal sealed class DailyUsageChartControl : Control
             Math.Max(left + 1, ClientSize.Width - right),
             Math.Max(top + 1, ClientSize.Height - bottom));
 
+        if (_latestSelectableDay is { } latest && _points.Count > 0)
+        {
+            var firstFuture = Enumerable.Range(0, _points.Count)
+                .FirstOrDefault(index => _points[index].Date > latest, -1);
+            if (firstFuture >= 0)
+            {
+                var x = plot.Left + (int)Math.Floor(plot.Width * firstFuture / (double)_points.Count);
+                using var future = new SolidBrush(Color.FromArgb(245, 245, 245));
+                e.Graphics.FillRectangle(future, x, plot.Top, Math.Max(0, plot.Right - x), plot.Height);
+            }
+        }
+
         var max = _maxSeconds;
         if (max <= 0)
         {
@@ -690,6 +707,7 @@ internal sealed class DailyUsageChartControl : Control
                 TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter |
                 TextFormatFlags.SingleLine);
             DrawLegend(e.Graphics, scale);
+            DrawSelectedDay(e.Graphics, plot, scale);
             DrawFocusedDay(e.Graphics, plot);
             if (Focused) ControlPaint.DrawFocusRectangle(e.Graphics, ClientRectangle);
             return;
@@ -744,6 +762,7 @@ internal sealed class DailyUsageChartControl : Control
         }
 
         DrawLegend(e.Graphics, scale);
+        DrawSelectedDay(e.Graphics, plot, scale);
         DrawFocusedDay(e.Graphics, plot);
         if (Focused) ControlPaint.DrawFocusRectangle(e.Graphics, ClientRectangle);
     }
@@ -764,9 +783,10 @@ internal sealed class DailyUsageChartControl : Control
         if (index >= 0)
         {
             var point = _points[index];
-            _toolTip.SetToolTip(this,
-                $"{point.Date:yyyy-MM-dd}\nActive: {FormatDuration(point.ActiveSeconds)}\n" +
-                $"Idle: {FormatDuration(point.IdleSeconds)}\nTotal: {FormatDuration(point.TotalSeconds)}");
+            _toolTip.SetToolTip(this, _latestSelectableDay is { } latest && point.Date > latest
+                ? $"{point.Date:yyyy-MM-dd}\nFuture date"
+                : $"{point.Date:yyyy-MM-dd}\nActive: {FormatDuration(point.ActiveSeconds)}\n" +
+                  $"Idle: {FormatDuration(point.IdleSeconds)}\nTotal: {FormatDuration(point.TotalSeconds)}");
         }
         else
         {
@@ -788,7 +808,8 @@ internal sealed class DailyUsageChartControl : Control
             _focusedIndex = Math.Clamp((int)((e.X - left) / ((right - left) / _points.Count)), 0, _points.Count - 1);
             UpdateAccessibleItem();
             Invalidate();
-            DaySelected?.Invoke(_points[_focusedIndex].Date);
+            if (_latestSelectableDay is null || _points[_focusedIndex].Date <= _latestSelectableDay)
+                DaySelected?.Invoke(_points[_focusedIndex].Date);
         }
         base.OnMouseDown(e);
     }
@@ -803,7 +824,8 @@ internal sealed class DailyUsageChartControl : Control
 
         if (e.KeyCode is Keys.Enter or Keys.Space && _focusedIndex >= 0 && _focusedIndex < _points.Count)
         {
-            DaySelected?.Invoke(_points[_focusedIndex].Date);
+            if (_latestSelectableDay is null || _points[_focusedIndex].Date <= _latestSelectableDay)
+                DaySelected?.Invoke(_points[_focusedIndex].Date);
             e.Handled = true;
             e.SuppressKeyPress = true;
             return;
@@ -848,6 +870,13 @@ internal sealed class DailyUsageChartControl : Control
 
         var point = _points[_focusedIndex];
         AccessibleName = $"Day {_focusedIndex + 1} of {_points.Count}: {point.Date:yyyy-MM-dd}";
+        if (_latestSelectableDay is { } latest && point.Date > latest)
+        {
+            AccessibleDescription = "Future date; no activity is available yet.";
+            AccessibilityNotifyClients(AccessibleEvents.NameChange, -1);
+            AccessibilityNotifyClients(AccessibleEvents.DescriptionChange, -1);
+            return;
+        }
         AccessibleDescription =
             $"Active {FormatDuration(point.ActiveSeconds)}, idle {FormatDuration(point.IdleSeconds)}, " +
             $"total {FormatDuration(point.TotalSeconds)}. Use the arrow keys to move between days and Enter to select.";
@@ -885,6 +914,16 @@ internal sealed class DailyUsageChartControl : Control
         var x = plot.Left + _focusedIndex * focusedSlot;
         ControlPaint.DrawFocusRectangle(graphics,
             new Rectangle((int)x, plot.Top, Math.Max(2, (int)Math.Ceiling(focusedSlot)), plot.Height));
+    }
+
+    void DrawSelectedDay(Graphics graphics, Rectangle plot, float scale)
+    {
+        if (_selectedIndex < 0 || _selectedIndex >= _points.Count) return;
+        var slot = plot.Width / (double)_points.Count;
+        var x1 = plot.Left + (int)Math.Floor(_selectedIndex * slot);
+        var x2 = plot.Left + (int)Math.Ceiling((_selectedIndex + 1) * slot);
+        using var pen = new Pen(Color.FromArgb(45, 90, 165), Math.Max(1f, scale));
+        graphics.DrawRectangle(pen, x1, plot.Top, Math.Max(1, x2 - x1 - 1), Math.Max(1, plot.Height - 1));
     }
 
     static string FormatAxis(int seconds)

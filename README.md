@@ -15,6 +15,7 @@ Uninstall: Quit from tray, delete the exe, and optionally remove `%APPDATA%\PcUs
 - **Left-click tray icon** — toggle the report popup.
 - **Right-click tray icon** — menu:
   - Open report
+  - Back up all data / restore full backup
   - Applications & categories...
   - Check for updates...
   - Autostart on Windows login (toggle)
@@ -26,8 +27,10 @@ Uninstall: Quit from tray, delete the exe, and optionally remove `%APPDATA%\PcUs
 - **Dashboard tab** — choose any recorded date, jump one day backward/forward, or return to Today. It shows tracked/active/idle totals, the top application, a color-coded 24-hour timeline (hatched idle spans are distinct from unrecorded time), selectable 7-day or 30-day active/idle bars, and the selected day's applications.
 - **Today + Week + Month tab** — all recorded processes for today, this week (Monday start), and this month.
 - **All-time tab** — cumulative usage for every recorded process.
+- **Compare tab** — today versus yesterday and this week versus last week, both using the same elapsed time from the start of each period. Rows compare tracked, active, idle, and category totals; the change column is current minus previous. On daylight-saving transition days the prior period is capped at its actual end.
 - Today's visible report refreshes every 5 seconds and preserves selected rows. Reporting uses an independent read-only SQLite connection in the background, so collection stays responsive; timer ticks coalesce behind an in-progress query instead of repeatedly canceling it. A historical Dashboard date stays cached instead of repeatedly querying unchanged data, and Import/application-rule changes invalidate that cache even while the report is hidden.
 - Each row shows the executable's icon, customizable display name and category color, duration, and share.
+- Each application list supports searching by display name, process name, or category and sorting by duration, name, or category. Share remains a percentage of the entire period when the list is filtered.
 - Missing or outdated executable paths are re-detected from running processes, Windows app registrations, and versioned install folders. Once successfully extracted, icons are also retained under `%APPDATA%\PcUsageTracker\icons\`, so an uninstalled or deleted executable can keep its last known image; unresolved entries use a neutral fallback instead of a broken-image X.
 - Hovering the process name shows the full exe path.
 - **Double-click a row** to open the folder containing that program.
@@ -35,13 +38,19 @@ Uninstall: Quit from tray, delete the exe, and optionally remove `%APPDATA%\PcUs
 - **Right-click any row → "Delete history & stop tracking"** to remove all past sessions for that process and prevent it from being recorded again. Confirmation prompt is shown.
 - Use **Applications & categories...** on the Dashboard toolbar to manage all application rules without returning to the tray menu.
 - Timeline and trend charts are keyboard-focusable; use the arrow, Home, and End keys to inspect individual spans or days. Their focused values and summaries are exposed to Windows accessibility tools. The timeline is pre-rendered for smooth resizing, and placement/ticks use the selected local day's exact UTC boundaries, explicitly labeling repeated or skipped daylight-saving hours.
-- Scroll the mouse wheel over the timeline to zoom around the pointer, down to a 15-minute window. Drag left or right to move through a zoomed-in day; the header shows the visible range and **Full day** resets it. Click a time to show the application, session bounds and duration and select its row; click an application row to highlight its spans, or click it again to clear the highlight. Zoom is retained during automatic refresh and resets when the selected date changes; keyboard navigation brings the selected span into view. Click a daily bar (or focus a day and press Enter) to open that date. The legend reports category shares of tracked time, including idle; per-application color overrides can differ from the category swatches.
+- Scroll the mouse wheel over the timeline to zoom around the pointer, down to a 15-minute window. Drag left or right to move through a zoomed-in day; the header shows the visible range and **Full day** resets it. Click a time to show the application, session bounds and duration and select its row; click an application row to highlight its spans, or click it again to clear the highlight. Zoom is retained during automatic refresh and resets when the selected date changes; keyboard navigation brings the selected span into view. Click a daily bar (or focus a day and press Enter) to open that date; the chart centers the selected date, with future days shaded and unavailable for selection. The legend reports category shares of tracked time, including idle; per-application color overrides can differ from the category swatches.
 
 ### Applications and categories
 
 Open **Applications & categories...** from the tray menu to manage presentation rules for every application found in history or executable metadata. The seeded categories are Coding, Game, Communication, Browsing, System, and Other; categories can be edited and additional categories can be created. **Other** is the permanent fallback for unassigned applications, so its color and order can be edited but it cannot be renamed or deleted.
 
-Aliases and category assignments are joined to reports dynamically. Changing a rule updates both historical and future usage displays without rewriting the underlying sessions. Choosing a category saves immediately; with several applications selected using Ctrl-click or Shift-click, the category is applied to all of them atomically. Other pending application edits are saved automatically when selection changes, category definitions change, or the editor closes. `__idle__` is reserved (case-insensitive), shown as an empty chart span, and cannot be edited.
+Aliases and category assignments are joined to reports dynamically. Changing a rule updates both historical and future usage displays without rewriting the underlying sessions. Choosing a category saves immediately; with several applications selected using Ctrl-click or Shift-click, the category is applied to all of them atomically. Other pending application edits are saved automatically when selection changes, category definitions change, or the editor closes. `__idle__` is reserved (case-insensitive), shown as a hatched chart span, and cannot be edited.
+
+### Full backup and restore
+
+The tray menu's **Back up all data...** creates a `.pcutbackup` archive containing a consistent SQLite snapshot (history, application rules, categories, exclusions, and database settings) and cached icons. The Windows autostart registry setting and log files are not included. Excel export remains available for working with session rows in a spreadsheet.
+
+**Restore full backup...** replaces the current database after integrity and schema checks. It first saves the current state under `%APPDATA%\PcUsageTracker\backups\`, pauses recording during replacement, and resumes afterward. Any sessions that were open when the backup was made are closed at their last recorded heartbeat, so time between backup and restore is not counted. Cached icons are restored when possible; failures are reported separately. Only backups of the current database schema are accepted.
 
 ### Excluded processes
 

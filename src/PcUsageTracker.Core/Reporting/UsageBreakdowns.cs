@@ -230,6 +230,14 @@ public readonly record struct DashboardSummary(
 /// <summary>Pure date rollover policy shared by the Dashboard UI and its tests.</summary>
 public static class DashboardDateNavigation
 {
+    /// <summary>Places the selected date at the center of the chart's date window.</summary>
+    public static DateOnly ChartThroughDay(DateOnly selectedDay, int dayCount)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(dayCount);
+        var endDayNumber = Math.Min((long)selectedDay.DayNumber + dayCount / 2, DateOnly.MaxValue.DayNumber - 1L);
+        return DateOnly.FromDayNumber((int)endDayNumber);
+    }
+
     public static DateOnly SelectionAfterTodayChanged(
         DateOnly previousToday,
         DateOnly selectedDay,

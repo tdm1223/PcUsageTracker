@@ -25,6 +25,7 @@ internal sealed class ReportForm : Form
     readonly TabPage _dashboardTab;
     readonly TabPage _overviewTab;
     readonly TabPage _allTimeTab;
+    readonly TabPage _comparisonTab;
     readonly DateTimePicker _dashboardDatePicker;
     readonly Button _dashboardNextButton;
     readonly Label _totalValue;
@@ -42,12 +43,16 @@ internal sealed class ReportForm : Form
     readonly DataGridView _weekGrid;
     readonly DataGridView _monthGrid;
     readonly DataGridView _allGrid;
+    readonly DataGridView _dayComparisonGrid;
+    readonly DataGridView _weekComparisonGrid;
     readonly System.Windows.Forms.Timer _refresh;
     readonly System.Windows.Forms.Timer _resizeDebounce;
     readonly AsyncIconCache _iconCache = new();
     readonly SemaphoreSlim _refreshGate = new(1, 1);
     readonly Dictionary<DashboardCacheKey, DashboardReportData> _historicalDashboardCache = [];
     readonly Dictionary<DataGridView, Dictionary<string, List<DataGridViewRow>>> _rowsByProcess = [];
+    readonly Dictionary<DataGridView, IReadOnlyList<ReportEntry>> _gridEntries = [];
+    readonly Dictionary<DataGridView, (TextBox Search, ComboBox Sort)> _gridOptions = [];
     readonly object _pendingIconSync = new();
     readonly Dictionary<string, IconResolvedEventArgs> _pendingIconUpdates =
         new(StringComparer.OrdinalIgnoreCase);
@@ -57,6 +62,7 @@ internal sealed class ReportForm : Form
     ReportRefreshRequest? _coalescedRefresh;
     long _refreshVersion;
     DateOnly _lastKnownToday;
+    DateOnly _dailyThroughDay;
     ReportViewKey? _lastAppliedView;
     DateTimeOffset _lastAppliedAt;
     bool _isResizing;
@@ -86,6 +92,7 @@ internal sealed class ReportForm : Form
         _dashboardTab = new TabPage("Dashboard");
         var localToday = DateOnly.FromDateTime(TimeZoneInfo.ConvertTime(_clock.UtcNow, TimeZoneInfo.Local).DateTime);
         _lastKnownToday = localToday;
+        _dailyThroughDay = DashboardDateNavigation.ChartThroughDay(localToday, 7);
         _dashboardDatePicker = new DateTimePicker
         {
             Format = DateTimePickerFormat.Custom,
@@ -176,7 +183,7 @@ internal sealed class ReportForm : Form
         lower.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 40));
         lower.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 60));
         lower.Controls.Add(WrapDailyChart(_dailyChart, _dailyRange), 0, 0);
-        lower.Controls.Add(WrapWithHeader("Applications", _dashboardGrid), 1, 0);
+        lower.Controls.Add(WrapApplicationGrid("Applications", _dashboardGrid), 1, 0);
 
         var dashboardLayout = new TableLayoutPanel
         {
@@ -226,18 +233,29 @@ internal sealed class ReportForm : Form
         _todayGrid = BuildGrid(this);
         _weekGrid = BuildGrid(this);
         _monthGrid = BuildGrid(this);
-        split.Controls.Add(WrapWithHeader("Today", _todayGrid), 0, 0);
-        split.Controls.Add(WrapWithHeader("This week", _weekGrid), 1, 0);
-        split.Controls.Add(WrapWithHeader("This month", _monthGrid), 2, 0);
+        split.Controls.Add(WrapApplicationGrid("Today", _todayGrid), 0, 0);
+        split.Controls.Add(WrapApplicationGrid("This week", _weekGrid), 1, 0);
+        split.Controls.Add(WrapApplicationGrid("This month", _monthGrid), 2, 0);
         _overviewTab.Controls.Add(split);
 
         _allTimeTab = new TabPage("All-time");
         _allGrid = BuildGrid(this);
-        _allTimeTab.Controls.Add(WrapWithHeader("All-time", _allGrid));
+        _allTimeTab.Controls.Add(WrapApplicationGrid("All-time", _allGrid));
+
+        _comparisonTab = new TabPage("Compare");
+        _dayComparisonGrid = BuildComparisonGrid();
+        _weekComparisonGrid = BuildComparisonGrid();
+        var comparisons = new TableLayoutPanel { Dock = DockStyle.Fill, RowCount = 2, ColumnCount = 1, Padding = new Padding(6) };
+        comparisons.RowStyles.Add(new RowStyle(SizeType.Percent, 50));
+        comparisons.RowStyles.Add(new RowStyle(SizeType.Percent, 50));
+        comparisons.Controls.Add(WrapComparison("Today vs yesterday · same elapsed time", _dayComparisonGrid), 0, 0);
+        comparisons.Controls.Add(WrapComparison("This week vs last week · same elapsed time", _weekComparisonGrid), 0, 1);
+        _comparisonTab.Controls.Add(comparisons);
 
         _tabs.TabPages.Add(_dashboardTab);
         _tabs.TabPages.Add(_overviewTab);
         _tabs.TabPages.Add(_allTimeTab);
+        _tabs.TabPages.Add(_comparisonTab);
         Controls.Add(_tabs);
         _iconCache.IconResolved += OnIconResolved;
 
@@ -248,12 +266,14 @@ internal sealed class ReportForm : Form
         _dashboardDatePicker.ValueChanged += (_, _) =>
         {
             UpdateDashboardDateNavigation(_clock.UtcNow);
+            if (!_suppressDashboardDateChange) UpdateDailyThroughDay();
             if (!_suppressDashboardDateChange && Visible &&
                 _tabs.SelectedTab == _dashboardTab && !_isResizing)
                 QueueVisibleRefresh();
         };
         _dailyRange.SelectedIndexChanged += (_, _) =>
         {
+            UpdateDailyThroughDay();
             if (Visible && _tabs.SelectedTab == _dashboardTab && !_isResizing)
                 QueueVisibleRefresh();
         };
@@ -354,6 +374,9 @@ internal sealed class ReportForm : Form
             DefaultCellStyle = new DataGridViewCellStyle { Alignment = DataGridViewContentAlignment.MiddleRight },
         });
 
+        foreach (DataGridViewColumn column in g.Columns)
+            column.SortMode = DataGridViewColumnSortMode.NotSortable;
+
         // 우클릭 → 행 선택 + 컨텍스트 메뉴
         var menu = new ContextMenuStrip();
         var editItem = new ToolStripMenuItem("Edit application...");
@@ -428,6 +451,29 @@ internal sealed class ReportForm : Form
         return panel;
     }
 
+    static DataGridView BuildComparisonGrid()
+    {
+        var grid = new BufferedDataGridView
+        {
+            Dock = DockStyle.Fill, ReadOnly = true, AllowUserToAddRows = false, AllowUserToDeleteRows = false,
+            RowHeadersVisible = false, AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.Fill,
+            BackgroundColor = SystemColors.Window, SelectionMode = DataGridViewSelectionMode.FullRowSelect,
+        };
+        foreach (var name in new[] { "Measure", "Current", "Previous", "Change" })
+            grid.Columns.Add(new DataGridViewTextBoxColumn { Name = name, HeaderText = name, SortMode = DataGridViewColumnSortMode.NotSortable });
+        return grid;
+    }
+
+    static Control WrapComparison(string title, Control grid)
+    {
+        var panel = new TableLayoutPanel { Dock = DockStyle.Fill, RowCount = 2, ColumnCount = 1, Padding = new Padding(4) };
+        panel.RowStyles.Add(new RowStyle(SizeType.Absolute, 26));
+        panel.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+        panel.Controls.Add(BuildSectionHeader(title), 0, 0);
+        panel.Controls.Add(grid, 0, 1);
+        return panel;
+    }
+
     static Control BuildSectionHeader(string header) => new Label
     {
         Text = header,
@@ -469,16 +515,17 @@ internal sealed class ReportForm : Form
         return panel;
     }
 
-    static Control WrapWithHeader(string header, Control inner)
+    Control WrapApplicationGrid(string header, DataGridView grid)
     {
         var panel = new TableLayoutPanel
         {
             Dock = DockStyle.Fill,
             ColumnCount = 1,
-            RowCount = 2,
+            RowCount = 3,
             Padding = new Padding(6),
         };
         panel.RowStyles.Add(new RowStyle(SizeType.Absolute, 24));
+        panel.RowStyles.Add(new RowStyle(SizeType.Absolute, 29));
         panel.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
         var label = new Label
         {
@@ -487,8 +534,25 @@ internal sealed class ReportForm : Form
             Font = new Font(SystemFonts.DefaultFont, FontStyle.Bold),
             TextAlign = ContentAlignment.MiddleLeft,
         };
+        var search = new TextBox { Dock = DockStyle.Fill, PlaceholderText = "Search apps or category", AccessibleName = $"Search {header}" };
+        var sort = new ComboBox { Dock = DockStyle.Fill, DropDownStyle = ComboBoxStyle.DropDownList, AccessibleName = $"Sort {header}" };
+        sort.Items.AddRange(["Time ↓", "Time ↑", "Name A–Z", "Name Z–A", "Category"]);
+        sort.SelectedIndex = 0;
+        var controls = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, RowCount = 1 };
+        controls.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 60));
+        controls.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 40));
+        controls.Controls.Add(search, 0, 0);
+        controls.Controls.Add(sort, 1, 0);
+        _gridOptions[grid] = (search, sort);
+        void RefreshList()
+        {
+            if (_gridEntries.TryGetValue(grid, out var entries)) Populate(grid, entries);
+        }
+        search.TextChanged += (_, _) => RefreshList();
+        sort.SelectedIndexChanged += (_, _) => RefreshList();
         panel.Controls.Add(label, 0, 0);
-        panel.Controls.Add(inner, 0, 1);
+        panel.Controls.Add(controls, 0, 1);
+        panel.Controls.Add(grid, 0, 2);
         return panel;
     }
 
@@ -496,7 +560,8 @@ internal sealed class ReportForm : Form
     {
         var now = _clock.UtcNow;
         RefreshTodayBoundary(now);
-        if (_tabs.SelectedTab == _dashboardTab && SelectedDashboardDate() != _lastKnownToday)
+        if (_tabs.SelectedTab == _dashboardTab && SelectedDashboardDate() != _lastKnownToday &&
+            _dailyThroughDay < _lastKnownToday)
             return;
         QueueVisibleRefresh(now);
     }
@@ -521,8 +586,9 @@ internal sealed class ReportForm : Form
         RefreshTodayBoundary(now);
         var request = CaptureRefreshRequest(now);
         if (request.Kind == ReportViewKind.Dashboard && request.Day != _lastKnownToday &&
+            request.DailyThroughDay < _lastKnownToday &&
             _historicalDashboardCache.TryGetValue(
-                new DashboardCacheKey(request.Day, request.DayCount), out var cached))
+                new DashboardCacheKey(request.Day, request.DayCount, request.DailyThroughDay), out var cached))
         {
             CancelPendingRefresh();
             ApplyReportData(request, cached);
@@ -612,6 +678,16 @@ internal sealed class ReportForm : Form
         if (request.Kind == ReportViewKind.AllTime)
             return new AllTimeReportData(aggregator.AllTime(request.Now));
 
+        if (request.Kind == ReportViewKind.Comparison)
+        {
+            var (day, week) = ComparisonPeriods.At(request.Now, TimeZoneInfo.Local);
+            return new ComparisonReportData(
+                UsageComparison.Create(aggregator.TopN(day.CurrentStart, day.CurrentEnd, request.Now),
+                    aggregator.TopN(day.PreviousStart, day.PreviousEnd, request.Now)),
+                UsageComparison.Create(aggregator.TopN(week.CurrentStart, week.CurrentEnd, request.Now),
+                    aggregator.TopN(week.PreviousStart, week.PreviousEnd, request.Now)));
+        }
+
         if (request.Kind == ReportViewKind.Overview)
         {
             var (todayFrom, todayTo) = Aggregator.TodayRange(request.Now);
@@ -629,7 +705,7 @@ internal sealed class ReportForm : Form
             DashboardSummary.FromApplications(applications),
             applications,
             aggregator.Timeline(request.Day, request.Now, zone),
-            aggregator.DailyTotals(request.Day, request.DayCount, request.Now, zone),
+            aggregator.DailyTotals(request.DailyThroughDay, request.DayCount, request.Now, zone),
             aggregator.CategoryTotals(request.Day, request.Now, zone));
     }
 
@@ -652,14 +728,14 @@ internal sealed class ReportForm : Form
                     : $"{dashboard.Summary.TopApplicationName}  " +
                       FormatDuration(dashboard.Summary.TopApplicationSeconds));
                 _timeline.SetData(request.Day, TimeZoneInfo.Local, dashboard.Timeline);
-                _dailyChart.SetData(dashboard.Daily);
+                _dailyChart.SetData(dashboard.Daily, request.Day, _lastKnownToday);
                 Populate(_dashboardGrid, dashboard.Applications);
                 if (dateChanged) _dashboardGrid.ClearSelection();
                 UpdateCategoryLegend(dashboard.Categories);
                 UpdateDashboardDateNavigation(request.Now);
-                if (request.Day != _lastKnownToday)
+                if (request.Day != _lastKnownToday && request.DailyThroughDay < _lastKnownToday)
                 {
-                    var cacheKey = new DashboardCacheKey(request.Day, request.DayCount);
+                    var cacheKey = new DashboardCacheKey(request.Day, request.DayCount, request.DailyThroughDay);
                     if (!_historicalDashboardCache.ContainsKey(cacheKey) &&
                         _historicalDashboardCache.Count >= HistoricalDashboardCacheLimit)
                         _historicalDashboardCache.Remove(_historicalDashboardCache.Keys.First());
@@ -674,6 +750,10 @@ internal sealed class ReportForm : Form
             case AllTimeReportData allTime:
                 Populate(_allGrid, allTime.Entries);
                 break;
+            case ComparisonReportData comparison:
+                PopulateComparison(_dayComparisonGrid, comparison.Day);
+                PopulateComparison(_weekComparisonGrid, comparison.Week);
+                break;
         }
 
         _lastAppliedView = request.ViewKey;
@@ -687,12 +767,15 @@ internal sealed class ReportForm : Form
                 ReportViewKind.Dashboard,
                 now,
                 SelectedDashboardDate(),
-                _dailyRange.SelectedIndex == 1 ? 30 : 7);
+                _dailyRange.SelectedIndex == 1 ? 30 : 7,
+                _dailyThroughDay);
         return new ReportRefreshRequest(
-            _tabs.SelectedTab == _allTimeTab ? ReportViewKind.AllTime : ReportViewKind.Overview,
+            _tabs.SelectedTab == _allTimeTab ? ReportViewKind.AllTime :
+            _tabs.SelectedTab == _comparisonTab ? ReportViewKind.Comparison : ReportViewKind.Overview,
             now,
             default,
-            0);
+            0,
+            default);
     }
 
     bool RequestMatchesVisibleState(ReportRefreshRequest request) =>
@@ -702,7 +785,8 @@ internal sealed class ReportForm : Form
     {
         var request = CaptureRefreshRequest(now);
         if (_lastAppliedView != request.ViewKey) return true;
-        if (request.Kind == ReportViewKind.Dashboard && request.Day != _lastKnownToday) return false;
+        if (request.Kind == ReportViewKind.Dashboard && request.Day != _lastKnownToday &&
+            request.DailyThroughDay < _lastKnownToday) return false;
         return now - _lastAppliedAt >= TimeSpan.FromMilliseconds(RefreshMs);
     }
 
@@ -755,6 +839,9 @@ internal sealed class ReportForm : Form
         else _dashboardDatePicker.Value = value;
     }
 
+    void UpdateDailyThroughDay() => _dailyThroughDay = DashboardDateNavigation.ChartThroughDay(
+        SelectedDashboardDate(), _dailyRange.SelectedIndex == 1 ? 30 : 7);
+
     void RefreshTodayBoundary(DateTimeOffset now)
     {
         var today = LocalToday(now);
@@ -764,9 +851,10 @@ internal sealed class ReportForm : Form
             return;
         }
 
+        var previousSelection = SelectedDashboardDate();
         var nextSelection = DashboardDateNavigation.SelectionAfterTodayChanged(
             _lastKnownToday,
-            SelectedDashboardDate(),
+            previousSelection,
             today);
         _lastKnownToday = today;
         var todayValue = today.ToDateTime(TimeOnly.MinValue);
@@ -780,6 +868,7 @@ internal sealed class ReportForm : Form
         {
             _suppressDashboardDateChange = false;
         }
+        UpdateDailyThroughDay();
         UpdateDashboardDateNavigation(now);
     }
 
@@ -793,10 +882,35 @@ internal sealed class ReportForm : Form
     static DateOnly LocalToday(DateTimeOffset now) =>
         DateOnly.FromDateTime(TimeZoneInfo.ConvertTime(now, TimeZoneInfo.Local).DateTime);
 
+    static void PopulateComparison(DataGridView grid, IReadOnlyList<UsageComparisonRow> rows)
+    {
+        grid.SuspendLayout();
+        try
+        {
+            grid.Rows.Clear();
+            foreach (var row in rows)
+            {
+                var difference = row.DifferenceSeconds == 0 ? "—" :
+                    $"{(row.DifferenceSeconds > 0 ? "+" : "−")}{FormatDuration(Math.Abs(row.DifferenceSeconds))}";
+                grid.Rows.Add(row.Name, FormatDuration(row.CurrentSeconds), FormatDuration(row.PreviousSeconds), difference);
+            }
+            grid.ClearSelection();
+        }
+        finally { grid.ResumeLayout(); }
+    }
+
     public void RequestReload() => QueueVisibleRefresh(invalidateHistorical: true);
 
     void Populate(DataGridView grid, IReadOnlyList<ReportEntry> entries)
     {
+        _gridEntries[grid] = entries;
+        long total = entries.Sum(r => (long)r.TotalSeconds);
+        if (_gridOptions.TryGetValue(grid, out var options))
+        {
+            if (grid is BufferedDataGridView buffered)
+                buffered.EmptyMessage = string.IsNullOrWhiteSpace(options.Search.Text) ? "No activity recorded" : "No matching applications";
+            entries = ReportListOptions.Apply(entries, options.Search.Text, (ReportListSort)Math.Max(0, options.Sort.SelectedIndex));
+        }
         var rebuildRows = !RowsMatchEntries(grid, entries);
         var selectedProcesses = rebuildRows
             ? grid.SelectedRows
@@ -812,7 +926,6 @@ internal sealed class ReportForm : Form
         grid.SuspendLayout();
         try
         {
-            long total = entries.Sum(r => (long)r.TotalSeconds);
             if (rebuildRows)
             {
                 grid.Rows.Clear();
@@ -1163,20 +1276,22 @@ internal sealed class ReportForm : Form
         Dashboard,
         Overview,
         AllTime,
+        Comparison,
     }
 
-    readonly record struct ReportViewKey(ReportViewKind Kind, DateOnly Day, int DayCount);
+    readonly record struct ReportViewKey(ReportViewKind Kind, DateOnly Day, int DayCount, DateOnly DailyThroughDay);
 
     readonly record struct ReportRefreshRequest(
         ReportViewKind Kind,
         DateTimeOffset Now,
         DateOnly Day,
-        int DayCount)
+        int DayCount,
+        DateOnly DailyThroughDay)
     {
-        public ReportViewKey ViewKey => new(Kind, Day, DayCount);
+        public ReportViewKey ViewKey => new(Kind, Day, DayCount, DailyThroughDay);
     }
 
-    readonly record struct DashboardCacheKey(DateOnly Day, int DayCount);
+    readonly record struct DashboardCacheKey(DateOnly Day, int DayCount, DateOnly DailyThroughDay);
 
     abstract record ReportData;
 
@@ -1193,10 +1308,12 @@ internal sealed class ReportForm : Form
         IReadOnlyList<ReportEntry> Month) : ReportData;
 
     sealed record AllTimeReportData(IReadOnlyList<ReportEntry> Entries) : ReportData;
+    sealed record ComparisonReportData(IReadOnlyList<UsageComparisonRow> Day, IReadOnlyList<UsageComparisonRow> Week) : ReportData;
 }
 
 internal sealed class BufferedDataGridView : DataGridView
 {
+    public string EmptyMessage { get; set; } = "No activity recorded";
     public BufferedDataGridView()
     {
         DoubleBuffered = true;
@@ -1213,7 +1330,7 @@ internal sealed class BufferedDataGridView : DataGridView
         emptyArea.Height -= ColumnHeadersVisible ? ColumnHeadersHeight : 0;
         TextRenderer.DrawText(
             e.Graphics,
-            "No activity recorded",
+            EmptyMessage,
             Font,
             emptyArea,
             SystemColors.GrayText,
