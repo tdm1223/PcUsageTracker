@@ -10,6 +10,7 @@ internal sealed class TimelineControl : Control, IMessageFilter
 
     readonly ToolTip _toolTip = new();
     IReadOnlyList<TimelinePaintItem> _segments = Array.Empty<TimelinePaintItem>();
+    IReadOnlyList<TimelineSegment> _rawSegments = Array.Empty<TimelineSegment>();
     IReadOnlyList<TimelineHourTick> _ticks = Array.Empty<TimelineHourTick>();
     int[] _hitIndexes = [];
     Bitmap? _raster;
@@ -27,10 +28,14 @@ internal sealed class TimelineControl : Control, IMessageFilter
     TimelineViewport _dragStartViewport;
     double? _selectedFraction;
     string? _highlightProcess;
+    bool _selectingRange;
+    double? _rangeStart;
+    double? _rangeEnd;
 
     public event Action<string?>? ProcessSelected;
     public event Action<string>? SelectionDetailsChanged;
     public event Action<string>? VisibleRangeChanged;
+    public event Action<DateTimeOffset, DateTimeOffset, IReadOnlyList<TimelineRangeRow>>? RangeSelected;
 
     public TimelineControl()
     {
@@ -42,7 +47,7 @@ internal sealed class TimelineControl : Control, IMessageFilter
                  ControlStyles.Selectable, true);
         MinimumSize = new Size(100, 76);
         TabStop = true;
-        AccessibleName = "24 hour usage timeline";
+        AccessibleName = UiText.T("24 hour usage timeline", "24시간 사용 타임라인");
         AccessibleRole = AccessibleRole.Graphic;
         Application.AddMessageFilter(this);
     }
@@ -59,12 +64,15 @@ internal sealed class TimelineControl : Control, IMessageFilter
             _viewport = TimelineViewport.FullDay;
             _selectedFraction = null;
             _highlightProcess = null;
+            _selectingRange = false;
+            _rangeStart = _rangeEnd = null;
         }
         _day = day;
         _zone = zone;
         var (dayStart, dayEnd) = Aggregator.DayRange(day, zone);
         _dayStart = dayStart;
         _dayEnd = dayEnd;
+        _rawSegments = segments;
         var projected = segments
             .Select(segment => new TimelinePaintItem(
                 segment,
@@ -78,9 +86,9 @@ internal sealed class TimelineControl : Control, IMessageFilter
         BuildRaster();
         var totalSeconds = segments.Sum(segment => (long)segment.TotalSeconds);
         _summary = segments.Count == 0
-            ? $"No activity recorded on {day:yyyy-MM-dd}."
-            : $"{_segments.Count} visible timeline spans on {day:yyyy-MM-dd}, " +
-              $"totaling {FormatDuration(totalSeconds)}. Applications are colored; idle spans are hatched.";
+            ? UiText.T($"No activity recorded on {day:yyyy-MM-dd}.", $"{day:yyyy-MM-dd} 기록이 없습니다.")
+            : UiText.T($"{_segments.Count} visible timeline spans on {day:yyyy-MM-dd}, totaling {FormatDuration(totalSeconds)}. Applications are colored; idle spans are hatched.",
+                $"{day:yyyy-MM-dd} 사용 구간 {_segments.Count}개, 합계 {FormatDuration(totalSeconds)}. 앱별 색상과 자리 비움 무늬가 표시됩니다.");
         _hoveredIndex = -1;
         if (_segments.Count == 0) _focusedIndex = -1;
         else if (_focusedIndex >= _segments.Count) _focusedIndex = _segments.Count - 1;
@@ -127,7 +135,7 @@ internal sealed class TimelineControl : Control, IMessageFilter
     {
         if (_selectedFraction is not { } fraction)
         {
-            SelectionDetailsChanged?.Invoke("Click the timeline to inspect a time.");
+            SelectionDetailsChanged?.Invoke(UiText.Translate("Click the timeline to inspect a time."));
             return;
         }
         var instant = _dayStart.AddTicks((long)((_dayEnd - _dayStart).Ticks * fraction));
@@ -135,13 +143,13 @@ internal sealed class TimelineControl : Control, IMessageFilter
         var index = FindSegmentAtDayFraction(fraction);
         if (index < 0)
         {
-            SelectionDetailsChanged?.Invoke($"Selected {local:HH:mm:ss} · No recorded activity");
+            SelectionDetailsChanged?.Invoke(UiText.T($"Selected {local:HH:mm:ss} · No recorded activity", $"선택 {local:HH:mm:ss} · 기록 없음"));
             return;
         }
         var segment = _segments[index].Segment;
         var start = TimeZoneInfo.ConvertTime(segment.StartAt, _zone);
         var end = TimeZoneInfo.ConvertTime(segment.EndAt, _zone);
-        SelectionDetailsChanged?.Invoke($"Selected {local:HH:mm:ss} · {segment.DisplayName} · " +
+        SelectionDetailsChanged?.Invoke($"{UiText.T("Selected", "선택")} {local:HH:mm:ss} · {(segment.IsIdle ? UiText.T(segment.DisplayName, "(자리 비움)") : segment.DisplayName)} · " +
             $"{start:HH:mm:ss}–{end:HH:mm:ss} · {FormatDuration(segment.TotalSeconds)}");
     }
 
@@ -194,11 +202,26 @@ internal sealed class TimelineControl : Control, IMessageFilter
             }
         }
 
+        if (_rangeStart is { } rangeStart && _rangeEnd is { } rangeEnd)
+        {
+            var lower = Math.Max(_viewport.Start, Math.Min(rangeStart, rangeEnd));
+            var upper = Math.Min(_viewport.End, Math.Max(rangeStart, rangeEnd));
+            if (upper > lower)
+            {
+                var leftX = track.Left + (int)Math.Round(track.Width * (lower - _viewport.Start) / _viewport.Width);
+                var rightX = track.Left + (int)Math.Round(track.Width * (upper - _viewport.Start) / _viewport.Width);
+                using var selection = new SolidBrush(Color.FromArgb(65, 25, 85, 180));
+                using var border = new Pen(Color.FromArgb(30, 75, 145), Math.Max(1, scale));
+                e.Graphics.FillRectangle(selection, leftX, track.Top, Math.Max(1, rightX - leftX), track.Height);
+                e.Graphics.DrawRectangle(border, leftX, track.Top, Math.Max(1, rightX - leftX), Math.Max(1, track.Height - 1));
+            }
+        }
+
         if (_segments.Count == 0)
         {
             TextRenderer.DrawText(
                 e.Graphics,
-                _day is null ? "Loading timeline..." : "No activity recorded",
+                UiText.Translate(_day is null ? "Loading timeline..." : "No activity recorded"),
                 Font,
                 track,
                 SystemColors.GrayText,
@@ -251,7 +274,8 @@ internal sealed class TimelineControl : Control, IMessageFilter
             var instant = _dayStart.AddTicks((long)((_dayEnd - _dayStart).Ticks * selected));
             var local = TimeZoneInfo.ConvertTime(instant, _zone);
             var index = FindSegmentAtDayFraction(selected);
-            var name = index < 0 ? "No activity" : _segments[index].Segment.DisplayName;
+            var name = index < 0 ? UiText.T("No activity", "기록 없음") :
+                _segments[index].Segment.IsIdle ? UiText.T("(Idle)", "(자리 비움)") : _segments[index].Segment.DisplayName;
             var text = $"{local:HH:mm:ss}  {name}";
             var boxWidth = Math.Min(track.Width, TextRenderer.MeasureText(text, Font).Width + (int)(10 * scale));
             var boxHeight = Math.Min(track.Height, Font.Height + (int)(6 * scale));
@@ -269,6 +293,11 @@ internal sealed class TimelineControl : Control, IMessageFilter
     protected override void OnMouseMove(MouseEventArgs e)
     {
         base.OnMouseMove(e);
+        if (_selectingRange)
+        {
+            UpdateRangeSelection(e.X);
+            return;
+        }
         if (_mousePressed && !_dragging && _dragStartViewport.Width < 1 &&
             Math.Abs(e.X - _dragStartX) >= Math.Max(1, SystemInformation.DragSize.Width / 2))
             _dragging = true;
@@ -302,7 +331,7 @@ internal sealed class TimelineControl : Control, IMessageFilter
             var start = TimeZoneInfo.ConvertTime(segment.StartAt, _zone);
             var end = TimeZoneInfo.ConvertTime(segment.EndAt, _zone);
             _toolTip.SetToolTip(this,
-                $"{segment.DisplayName}\n{segment.CategoryName ?? (segment.IsIdle ? "Idle" : "Other")}\n" +
+                $"{(segment.IsIdle ? UiText.T(segment.DisplayName, "(자리 비움)") : segment.DisplayName)}\n{UiText.Category(segment.CategoryName ?? (segment.IsIdle ? "Idle" : "Other"))}\n" +
                 $"{start:HH:mm:ss zzz} – {end:HH:mm:ss zzz}\n{FormatDuration(segment.TotalSeconds)}");
         }
         else
@@ -316,6 +345,12 @@ internal sealed class TimelineControl : Control, IMessageFilter
         Focus();
         if (e.Button == MouseButtons.Left && _day is not null)
         {
+            if ((ModifierKeys & Keys.Shift) != 0)
+            {
+                StartRangeSelection(e.X);
+                base.OnMouseDown(e);
+                return;
+            }
             _mousePressed = true;
             _dragging = false;
             _dragStartX = e.X;
@@ -328,6 +363,12 @@ internal sealed class TimelineControl : Control, IMessageFilter
 
     protected override void OnMouseUp(MouseEventArgs e)
     {
+        if (e.Button == MouseButtons.Left && _selectingRange)
+        {
+            FinishRangeSelection(e.X);
+            base.OnMouseUp(e);
+            return;
+        }
         if (e.Button == MouseButtons.Left && _mousePressed)
         {
             if (!_dragging && ClientRectangle.Contains(e.Location))
@@ -356,8 +397,48 @@ internal sealed class TimelineControl : Control, IMessageFilter
         {
             _dragging = false;
             _mousePressed = false;
+            _selectingRange = false;
         }
         base.OnMouseCaptureChanged(e);
+    }
+
+    double FractionAtX(int x)
+    {
+        var margin = 10d * DeviceDpi / 96d;
+        var position = Math.Clamp((x - margin) / Math.Max(1, ClientSize.Width - 2 * margin), 0, 1);
+        return _viewport.Start + position * _viewport.Width;
+    }
+
+    void StartRangeSelection(int x)
+    {
+        _selectingRange = true;
+        _mousePressed = false;
+        _dragStartX = x;
+        _rangeStart = _rangeEnd = FractionAtX(x);
+        _toolTip.SetToolTip(this, null);
+        Capture = true;
+        Invalidate();
+    }
+
+    void UpdateRangeSelection(int x)
+    {
+        _rangeEnd = FractionAtX(x);
+        Invalidate();
+    }
+
+    void FinishRangeSelection(int x)
+    {
+        UpdateRangeSelection(x);
+        var fromFraction = Math.Min(_rangeStart!.Value, _rangeEnd!.Value);
+        var toFraction = Math.Max(_rangeStart.Value, _rangeEnd.Value);
+        var isDrag = Math.Abs(x - _dragStartX) >= Math.Max(1, SystemInformation.DragSize.Width / 2);
+        _selectingRange = false;
+        Capture = false;
+        if (!isDrag || toFraction <= fromFraction) { _rangeStart = _rangeEnd = null; Invalidate(); return; }
+        var durationTicks = (_dayEnd - _dayStart).Ticks;
+        var from = _dayStart.AddTicks((long)(durationTicks * fromFraction));
+        var to = _dayStart.AddTicks((long)(durationTicks * toFraction));
+        RangeSelected?.Invoke(from, to, TimelineRangeSummary.Create(_rawSegments, from, to));
     }
 
     protected override void OnMouseLeave(EventArgs e)
@@ -482,7 +563,7 @@ internal sealed class TimelineControl : Control, IMessageFilter
     {
         if (_focusedIndex < 0 || _focusedIndex >= _segments.Count)
         {
-            AccessibleName = "24 hour usage timeline";
+            AccessibleName = UiText.T("24 hour usage timeline", "24시간 사용 타임라인");
             AccessibleDescription = _summary;
             return;
         }
@@ -490,11 +571,11 @@ internal sealed class TimelineControl : Control, IMessageFilter
         var segment = _segments[_focusedIndex].Segment;
         var start = TimeZoneInfo.ConvertTime(segment.StartAt, _zone);
         var end = TimeZoneInfo.ConvertTime(segment.EndAt, _zone);
-        AccessibleName = $"Timeline span {_focusedIndex + 1} of {_segments.Count}: {segment.DisplayName}";
-        AccessibleDescription =
-            $"{segment.CategoryName ?? (segment.IsIdle ? "Idle" : "Other")}, " +
-            $"{start:HH:mm:ss zzz} to {end:HH:mm:ss zzz}, {FormatDuration(segment.TotalSeconds)}. " +
-            "Use the arrow keys to move between spans. Use the mouse wheel to zoom and drag to pan.";
+        AccessibleName = UiText.T($"Timeline span {_focusedIndex + 1} of {_segments.Count}: {segment.DisplayName}",
+            $"사용 구간 {_focusedIndex + 1}/{_segments.Count}: {segment.DisplayName}");
+        AccessibleDescription = UiText.T(
+            $"{segment.CategoryName ?? (segment.IsIdle ? "Idle" : "Other")}, {start:HH:mm:ss zzz} to {end:HH:mm:ss zzz}, {FormatDuration(segment.TotalSeconds)}. Use the arrow keys to move between spans. Use the mouse wheel to zoom and drag to pan. Shift-drag selects a range.",
+            $"{UiText.Category(segment.CategoryName ?? (segment.IsIdle ? "Idle" : "Other"))}, {start:HH:mm:ss zzz}부터 {end:HH:mm:ss zzz}까지, {FormatDuration(segment.TotalSeconds)}. 방향키로 구간을 이동하고, 휠로 확대하며, 드래그로 이동합니다. Shift와 드래그로 구간을 선택합니다.");
         AccessibilityNotifyClients(AccessibleEvents.NameChange, -1);
         AccessibilityNotifyClients(AccessibleEvents.DescriptionChange, -1);
     }
@@ -606,7 +687,7 @@ internal sealed class TimelineControl : Control, IMessageFilter
     protected override void OnLeave(EventArgs e)
     {
         base.OnLeave(e);
-        AccessibleName = "24 hour usage timeline";
+        AccessibleName = UiText.T("24 hour usage timeline", "24시간 사용 타임라인");
         AccessibleDescription = _summary;
         Invalidate();
     }
@@ -638,7 +719,7 @@ internal sealed class DailyUsageChartControl : Control
                  ControlStyles.Selectable, true);
         MinimumSize = new Size(180, 140);
         TabStop = true;
-        AccessibleName = "Daily active and idle usage chart";
+        AccessibleName = UiText.T("Daily active and idle usage chart", "일별 활성 시간 및 자리 비움 그래프");
         AccessibleRole = AccessibleRole.Graphic;
     }
 
@@ -654,10 +735,10 @@ internal sealed class DailyUsageChartControl : Control
         var idle = points.Sum(point => (long)point.IdleSeconds);
         _summary = points.Count == 0 || _maxSeconds == 0
             ? points.Count == 0
-                ? "No daily usage data."
-                : $"No activity from {points[0].Date:yyyy-MM-dd} to {points[^1].Date:yyyy-MM-dd}."
-            : $"{points.Count} day trend from {points[0].Date:yyyy-MM-dd} to {points[^1].Date:yyyy-MM-dd}. " +
-              $"Active {FormatDuration(active)}, idle {FormatDuration(idle)}.";
+                ? UiText.T("No daily usage data.", "일별 사용 기록이 없습니다.")
+                : UiText.T($"No activity from {points[0].Date:yyyy-MM-dd} to {points[^1].Date:yyyy-MM-dd}.", $"{points[0].Date:yyyy-MM-dd}부터 {points[^1].Date:yyyy-MM-dd}까지 기록이 없습니다.")
+            : UiText.T($"{points.Count} day trend from {points[0].Date:yyyy-MM-dd} to {points[^1].Date:yyyy-MM-dd}. Active {FormatDuration(active)}, idle {FormatDuration(idle)}.",
+                $"{points[0].Date:yyyy-MM-dd}부터 {points[^1].Date:yyyy-MM-dd}까지 {points.Count}일. 활성 {FormatDuration(active)}, 자리 비움 {FormatDuration(idle)}.");
         _hoveredIndex = -1;
         if (points.Count == 0) _focusedIndex = -1;
         else if (_focusedIndex >= points.Count) _focusedIndex = points.Count - 1;
@@ -700,7 +781,7 @@ internal sealed class DailyUsageChartControl : Control
         {
             TextRenderer.DrawText(
                 e.Graphics,
-                "No activity in this range",
+                UiText.Translate("No activity in this range"),
                 Font,
                 plot,
                 SystemColors.GrayText,
@@ -784,9 +865,9 @@ internal sealed class DailyUsageChartControl : Control
         {
             var point = _points[index];
             _toolTip.SetToolTip(this, _latestSelectableDay is { } latest && point.Date > latest
-                ? $"{point.Date:yyyy-MM-dd}\nFuture date"
-                : $"{point.Date:yyyy-MM-dd}\nActive: {FormatDuration(point.ActiveSeconds)}\n" +
-                  $"Idle: {FormatDuration(point.IdleSeconds)}\nTotal: {FormatDuration(point.TotalSeconds)}");
+                ? $"{point.Date:yyyy-MM-dd}\n{UiText.T("Future date", "미래 날짜") }"
+                : $"{point.Date:yyyy-MM-dd}\n{UiText.T("Active", "활성 시간")}: {FormatDuration(point.ActiveSeconds)}\n" +
+                  $"{UiText.T("Idle", "자리 비움")}: {FormatDuration(point.IdleSeconds)}\n{UiText.T("Total", "합계")}: {FormatDuration(point.TotalSeconds)}");
         }
         else
         {
@@ -863,23 +944,23 @@ internal sealed class DailyUsageChartControl : Control
     {
         if (_focusedIndex < 0 || _focusedIndex >= _points.Count)
         {
-            AccessibleName = "Daily active and idle usage chart";
+            AccessibleName = UiText.T("Daily active and idle usage chart", "일별 활성 시간 및 자리 비움 그래프");
             AccessibleDescription = _summary;
             return;
         }
 
         var point = _points[_focusedIndex];
-        AccessibleName = $"Day {_focusedIndex + 1} of {_points.Count}: {point.Date:yyyy-MM-dd}";
+        AccessibleName = UiText.T($"Day {_focusedIndex + 1} of {_points.Count}: {point.Date:yyyy-MM-dd}", $"날짜 {_focusedIndex + 1}/{_points.Count}: {point.Date:yyyy-MM-dd}");
         if (_latestSelectableDay is { } latest && point.Date > latest)
         {
-            AccessibleDescription = "Future date; no activity is available yet.";
+            AccessibleDescription = UiText.T("Future date; no activity is available yet.", "미래 날짜로 아직 기록이 없습니다.");
             AccessibilityNotifyClients(AccessibleEvents.NameChange, -1);
             AccessibilityNotifyClients(AccessibleEvents.DescriptionChange, -1);
             return;
         }
-        AccessibleDescription =
-            $"Active {FormatDuration(point.ActiveSeconds)}, idle {FormatDuration(point.IdleSeconds)}, " +
-            $"total {FormatDuration(point.TotalSeconds)}. Use the arrow keys to move between days and Enter to select.";
+        AccessibleDescription = UiText.T(
+            $"Active {FormatDuration(point.ActiveSeconds)}, idle {FormatDuration(point.IdleSeconds)}, total {FormatDuration(point.TotalSeconds)}. Use the arrow keys to move between days and Enter to select.",
+            $"활성 {FormatDuration(point.ActiveSeconds)}, 자리 비움 {FormatDuration(point.IdleSeconds)}, 합계 {FormatDuration(point.TotalSeconds)}. 방향키로 날짜를 이동하고 Enter로 선택합니다.");
         AccessibilityNotifyClients(AccessibleEvents.NameChange, -1);
         AccessibilityNotifyClients(AccessibleEvents.DescriptionChange, -1);
     }
@@ -898,12 +979,13 @@ internal sealed class DailyUsageChartControl : Control
         using var active = new SolidBrush(ActiveColor);
         using var idle = new Pen(IdleColor) { DashStyle = System.Drawing.Drawing2D.DashStyle.Dot };
         graphics.FillRectangle(active, 8, y + 2, swatch, swatch);
-        TextRenderer.DrawText(graphics, "Active", Font, new Point(11 + swatch, y), ForeColor,
+        var activeLabel = UiText.T("Active", "활성");
+        TextRenderer.DrawText(graphics, activeLabel, Font, new Point(11 + swatch, y), ForeColor,
             TextFormatFlags.NoPadding);
-        var activeWidth = TextRenderer.MeasureText("Active", Font).Width;
+        var activeWidth = TextRenderer.MeasureText(activeLabel, Font).Width;
         var idleX = 18 + swatch + activeWidth;
         graphics.DrawRectangle(idle, idleX, y + 2, swatch, swatch);
-        TextRenderer.DrawText(graphics, "Idle", Font, new Point(idleX + swatch + 3, y), ForeColor,
+        TextRenderer.DrawText(graphics, UiText.T("Idle", "자리 비움"), Font, new Point(idleX + swatch + 3, y), ForeColor,
             TextFormatFlags.NoPadding);
     }
 
@@ -958,7 +1040,7 @@ internal sealed class DailyUsageChartControl : Control
     protected override void OnLeave(EventArgs e)
     {
         base.OnLeave(e);
-        AccessibleName = "Daily active and idle usage chart";
+        AccessibleName = UiText.T("Daily active and idle usage chart", "일별 활성 시간 및 자리 비움 그래프");
         AccessibleDescription = _summary;
         Invalidate();
     }

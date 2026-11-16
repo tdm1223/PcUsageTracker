@@ -1,5 +1,7 @@
 namespace PcUsageTracker.Core.Models;
 
+public readonly record struct ExcludedProcess(string ProcessName, string? Reason, DateTimeOffset ExcludedAt);
+
 /// <summary>A user-manageable application category.</summary>
 public readonly record struct ApplicationCategory(
     long Id,

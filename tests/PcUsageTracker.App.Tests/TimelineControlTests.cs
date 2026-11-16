@@ -72,6 +72,28 @@ public class TimelineControlTests
     }
 
     [Fact]
+    public void Range_selection_reports_clipped_original_segments()
+    {
+        RunOnSta(() =>
+        {
+            using var control = new TimelineControl { Size = new Size(980, 100) };
+            var day = new DateOnly(2026, 11, 10);
+            var midnight = new DateTimeOffset(2026, 11, 10, 0, 0, 0, TimeSpan.Zero);
+            control.SetData(day, TimeZoneInfo.Utc,
+            [
+                new TimelineSegment("a", "Alpha", "Work", 0, midnight.AddHours(8), midnight.AddHours(13)),
+                new TimelineSegment("A", "Alpha", "Work", 0, midnight.AddHours(9), midnight.AddHours(10)),
+            ]);
+            IReadOnlyList<TimelineRangeRow>? result = null;
+            control.RangeSelected += (_, _, rows) => result = rows;
+            typeof(TimelineControl).GetMethod("StartRangeSelection", BindingFlags.Instance | BindingFlags.NonPublic)!.Invoke(control, [250]);
+            typeof(TimelineControl).GetMethod("FinishRangeSelection", BindingFlags.Instance | BindingFlags.NonPublic)!.Invoke(control, [490]);
+            var row = Assert.Single(result!);
+            Assert.Equal(5 * 3600, row.TotalSeconds);
+        });
+    }
+
+    [Fact]
     public void Daily_chart_click_selects_the_corresponding_date()
     {
         RunOnSta(() =>

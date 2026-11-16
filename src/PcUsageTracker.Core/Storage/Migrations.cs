@@ -162,13 +162,16 @@ public static class Migrations
             seedCmd.Transaction = tx;
             seedCmd.CommandText = """
                 INSERT OR IGNORE INTO excluded_processes (name, reason, excluded_at)
-                VALUES ($n, 'system-ui', $t);
+                SELECT $n, 'system-ui', $t
+                WHERE NOT EXISTS (SELECT 1 FROM settings WHERE key = $allowed);
                 """;
             var nameParam = seedCmd.Parameters.Add("$n", Microsoft.Data.Sqlite.SqliteType.Text);
+            var allowedParam = seedCmd.Parameters.Add("$allowed", Microsoft.Data.Sqlite.SqliteType.Text);
             seedCmd.Parameters.AddWithValue("$t", DateTimeOffset.UtcNow.ToUnixTimeSeconds());
             foreach (var name in DefaultSystemUiExclusions)
             {
                 nameParam.Value = name;
+                allowedParam.Value = SqliteStore.AllowedExclusionKey(name);
                 seedCmd.ExecuteNonQuery();
             }
         }

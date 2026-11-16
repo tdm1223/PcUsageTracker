@@ -26,8 +26,14 @@ public static class FullBackup
     public static void Export(SqliteStore store, string iconDirectory, string destination)
     {
         ArgumentNullException.ThrowIfNull(store);
+        Export(store.Connection, iconDirectory, destination);
+    }
+
+    public static void Export(SqliteConnection source, string iconDirectory, string destination)
+    {
+        ArgumentNullException.ThrowIfNull(source);
         var target = Path.GetFullPath(destination);
-        var database = Path.GetFullPath(store.Connection.DataSource);
+        var database = Path.GetFullPath(source.DataSource);
         if (string.Equals(target, database, StringComparison.OrdinalIgnoreCase) ||
             string.Equals(target, database + "-wal", StringComparison.OrdinalIgnoreCase) ||
             string.Equals(target, database + "-shm", StringComparison.OrdinalIgnoreCase))
@@ -39,7 +45,7 @@ public static class FullBackup
         try
         {
             using (var snapshot = OpenDatabase(temporaryDatabase, SqliteOpenMode.ReadWriteCreate))
-                store.Connection.BackupDatabase(snapshot);
+                source.BackupDatabase(snapshot);
             if (new FileInfo(temporaryDatabase).Length > MaxDatabaseBytes)
                 throw new InvalidDataException("The database exceeds the backup size limit.");
             using (var archive = ZipFile.Open(temporaryArchive, ZipArchiveMode.Create))

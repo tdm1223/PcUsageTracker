@@ -61,6 +61,7 @@ internal sealed class IdleSettingsForm : Form
         AcceptButton = ok;
         CancelButton = cancel;
         Controls.AddRange(new Control[] { label, _input, unitLabel, ok, cancel });
+        UiText.Apply(this);
     }
 
     public int Minutes => (int)_input.Value;

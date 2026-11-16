@@ -68,6 +68,7 @@ internal sealed class ApplicationRulesForm : Form
         {
             if (!TrySavePendingRule(reloadApplications: false)) e.Cancel = true;
         };
+        UiText.Apply(this);
     }
 
     TabPage BuildApplicationsTab()
@@ -195,7 +196,7 @@ internal sealed class ApplicationRulesForm : Form
             _categoriesGrid.Rows.Clear();
             foreach (var category in categories)
             {
-                var index = _categoriesGrid.Rows.Add(category.Name, ToHex(category.ColorRgb), category.SortOrder);
+                var index = _categoriesGrid.Rows.Add(UiText.Category(category.Name), ToHex(category.ColorRgb), category.SortOrder);
                 var row = _categoriesGrid.Rows[index];
                 row.Tag = category;
                 ApplyColorCell(row.Cells["Color"], category.ColorRgb);
@@ -223,7 +224,7 @@ internal sealed class ApplicationRulesForm : Form
         foreach (var app in _store.ListKnownApplications())
         {
             var index = _applicationsGrid.Rows.Add(
-                app.ProcessName, app.DisplayName, app.CategoryName, ToHex(app.ResolvedColorRgb), app.ExePath ?? string.Empty);
+                app.ProcessName, app.DisplayName, UiText.Category(app.CategoryName), ToHex(app.ResolvedColorRgb), app.ExePath ?? string.Empty);
             var row = _applicationsGrid.Rows[index];
             row.Tag = app;
             ApplyColorCell(row.Cells["Color"], app.ResolvedColorRgb);
@@ -265,7 +266,7 @@ internal sealed class ApplicationRulesForm : Form
 
         if (selected.Length > 1)
         {
-            _selectedProcessLabel.Text = $"{selected.Length} applications selected";
+            _selectedProcessLabel.Text = UiText.T($"{selected.Length} applications selected", $"앱 {selected.Length}개 선택됨");
             _aliasText.Text = string.Empty;
             _categoryCombo.SelectedIndex = -1;
             _useCustomColor.Checked = false;
@@ -278,7 +279,7 @@ internal sealed class ApplicationRulesForm : Form
 
         if (app is null)
         {
-            _selectedProcessLabel.Text = "Select an application above.";
+            _selectedProcessLabel.Text = UiText.Translate("Select an application above.");
             _aliasText.Text = string.Empty;
             _categoryCombo.SelectedIndex = -1;
             _useCustomColor.Checked = false;
@@ -290,7 +291,7 @@ internal sealed class ApplicationRulesForm : Form
         }
 
         var value = app.Value;
-        _selectedProcessLabel.Text = $"Process identity: {value.ProcessName}";
+        _selectedProcessLabel.Text = $"{UiText.T("Process identity", "프로세스 이름")}: {value.ProcessName}";
         _aliasText.Text = value.Alias ?? string.Empty;
         SelectCategory(value.CategoryId);
         _selectedColor = value.ColorOverrideRgb ?? value.ResolvedColorRgb;
@@ -396,7 +397,7 @@ internal sealed class ApplicationRulesForm : Form
             row.Tag = updated;
             row.Cells["Process"].Value = updated.ProcessName;
             row.Cells["Alias"].Value = updated.DisplayName;
-            row.Cells["Category"].Value = updated.CategoryName;
+            row.Cells["Category"].Value = UiText.Category(updated.CategoryName);
             row.Cells["Color"].Value = ToHex(updated.ResolvedColorRgb);
             row.Cells["Path"].Value = updated.ExePath ?? string.Empty;
             ApplyColorCell(row.Cells["Color"], updated.ResolvedColorRgb);
@@ -484,8 +485,8 @@ internal sealed class ApplicationRulesForm : Form
         if (processNames.Length < 2) return;
         if (_categoryCombo.SelectedItem is not CategoryChoice category)
         {
-            MessageBox.Show(this, "Choose a category to apply to the selected applications.",
-                "Bulk category", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            MessageBox.Show(this, UiText.T("Choose a category to apply to the selected applications.", "선택한 앱에 적용할 분류를 선택하세요."),
+                UiText.T("Bulk category", "분류 일괄 적용"), MessageBoxButtons.OK, MessageBoxIcon.Information);
             _categoryCombo.DroppedDown = true;
             return;
         }
@@ -558,8 +559,9 @@ internal sealed class ApplicationRulesForm : Form
             _categoriesGrid.SelectedRows[0].Tag is not ApplicationCategory category) return;
         if (category.Id == DefaultApplicationCategories.OtherId) return;
         var result = MessageBox.Show(this,
-            $"Delete category '{category.Name}'?\n\nApplications in it will become unassigned; their history is not changed.",
-            "Delete category", MessageBoxButtons.YesNo, MessageBoxIcon.Question,
+            UiText.T($"Delete category '{category.Name}'?\n\nApplications in it will become unassigned; their history is not changed.",
+                $"'{UiText.Category(category.Name)}' 분류를 삭제하시겠습니까?\n\n해당 앱은 미지정으로 변경되며 사용 기록은 유지됩니다."),
+            UiText.T("Delete category", "분류 삭제"), MessageBoxButtons.YesNo, MessageBoxIcon.Question,
             MessageBoxDefaultButton.Button2);
         if (result != DialogResult.Yes) return;
         try
@@ -595,7 +597,7 @@ internal sealed class ApplicationRulesForm : Form
     void ShowError(string message, Exception ex)
     {
         Log.Error(ex, "Application/category editor operation failed");
-        MessageBox.Show(this, $"{message}\n\n{ex.Message}", "Error",
+        MessageBox.Show(this, $"{UiText.Translate(message)}\n\n{ex.Message}", UiText.T("Error", "오류"),
             MessageBoxButtons.OK, MessageBoxIcon.Error);
     }
 
@@ -633,7 +635,7 @@ internal sealed class ApplicationRulesForm : Form
 
     sealed record CategoryChoice(long? Id, string Name)
     {
-        public override string ToString() => Name;
+        public override string ToString() => UiText.Category(Name);
     }
 }
 
@@ -697,7 +699,7 @@ internal sealed class CategoryEditorForm : Form
         {
             if (CategoryName.Length == 0)
             {
-                MessageBox.Show(this, "Enter a category name.", "Category name",
+                MessageBox.Show(this, UiText.T("Enter a category name.", "분류 이름을 입력하세요."), UiText.T("Category name", "분류 이름"),
                     MessageBoxButtons.OK, MessageBoxIcon.Information);
                 _name.Focus();
                 return;
@@ -718,5 +720,6 @@ internal sealed class CategoryEditorForm : Form
         Controls.Add(buttons);
         AcceptButton = save;
         CancelButton = cancel;
+        UiText.Apply(this);
     }
 }

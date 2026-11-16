@@ -208,29 +208,65 @@ public sealed class SqliteStore : ISessionSink, IDisposable
         return list;
     }
 
+    public IReadOnlyList<ExcludedProcess> ListExclusionEntries()
+    {
+        using var cmd = _conn.CreateCommand();
+        cmd.CommandText = "SELECT name, reason, excluded_at FROM excluded_processes ORDER BY name COLLATE NOCASE;";
+        var entries = new List<ExcludedProcess>();
+        using var reader = cmd.ExecuteReader();
+        while (reader.Read()) entries.Add(new ExcludedProcess(reader.GetString(0),
+            reader.IsDBNull(1) ? null : reader.GetString(1), DateTimeOffset.FromUnixTimeSeconds(reader.GetInt64(2))));
+        return entries;
+    }
+
+    internal static string AllowedExclusionKey(string processName) => $"exclusion.allow:{processName.Trim().ToUpperInvariant()}";
+
     /// <summary>제외 목록에 추가 (UPSERT). 이미 있으면 reason/excluded_at 갱신.</summary>
     public void AddExclusion(string processName, string? reason, DateTimeOffset at)
     {
+        processName = ValidateProcessName(processName);
+        using var transaction = _conn.BeginTransaction();
         using var cmd = _conn.CreateCommand();
+        cmd.Transaction = transaction;
         cmd.CommandText = """
+            DELETE FROM excluded_processes WHERE name = $n COLLATE NOCASE;
             INSERT INTO excluded_processes (name, reason, excluded_at) VALUES ($n, $r, $t)
             ON CONFLICT(name) DO UPDATE SET
               reason = excluded.reason,
               excluded_at = excluded.excluded_at;
+            DELETE FROM settings WHERE key = $allowed;
             """;
         cmd.Parameters.AddWithValue("$n", processName);
         cmd.Parameters.AddWithValue("$r", (object?)reason ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$t", at.ToUnixTimeSeconds());
+        cmd.Parameters.AddWithValue("$allowed", AllowedExclusionKey(processName));
         cmd.ExecuteNonQuery();
+        transaction.Commit();
     }
 
     /// <summary>제외 목록에서 제거. 없으면 no-op.</summary>
-    public void RemoveExclusion(string processName)
+    public void RemoveExclusion(string processName) => RemoveExclusions([processName]);
+
+    public void RemoveExclusions(IEnumerable<string> processNames)
     {
+        ArgumentNullException.ThrowIfNull(processNames);
+        var names = processNames.Select(ValidateProcessName).Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
+        using var transaction = _conn.BeginTransaction();
         using var cmd = _conn.CreateCommand();
-        cmd.CommandText = "DELETE FROM excluded_processes WHERE name = $n COLLATE NOCASE;";
-        cmd.Parameters.AddWithValue("$n", processName);
-        cmd.ExecuteNonQuery();
+        cmd.Transaction = transaction;
+        cmd.CommandText = """
+            DELETE FROM excluded_processes WHERE name = $n COLLATE NOCASE;
+            INSERT OR REPLACE INTO settings(key, value) VALUES ($allowed, '1');
+            """;
+        var name = cmd.Parameters.Add("$n", SqliteType.Text);
+        var allowed = cmd.Parameters.Add("$allowed", SqliteType.Text);
+        foreach (var process in names)
+        {
+            name.Value = process;
+            allowed.Value = AllowedExclusionKey(process);
+            cmd.ExecuteNonQuery();
+        }
+        transaction.Commit();
     }
 
     /// <summary>

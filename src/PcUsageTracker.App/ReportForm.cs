@@ -26,6 +26,8 @@ internal sealed class ReportForm : Form
     readonly TabPage _overviewTab;
     readonly TabPage _allTimeTab;
     readonly TabPage _comparisonTab;
+    readonly TabPage _periodTab;
+    readonly PeriodStatisticsControl _periodStatistics;
     readonly DateTimePicker _dashboardDatePicker;
     readonly Button _dashboardNextButton;
     readonly Label _totalValue;
@@ -45,6 +47,8 @@ internal sealed class ReportForm : Form
     readonly DataGridView _allGrid;
     readonly DataGridView _dayComparisonGrid;
     readonly DataGridView _weekComparisonGrid;
+    readonly Label _dayComparisonRange = new() { Dock = DockStyle.Fill, AutoEllipsis = true, TextAlign = ContentAlignment.MiddleLeft };
+    readonly Label _weekComparisonRange = new() { Dock = DockStyle.Fill, AutoEllipsis = true, TextAlign = ContentAlignment.MiddleLeft };
     readonly System.Windows.Forms.Timer _refresh;
     readonly System.Windows.Forms.Timer _resizeDebounce;
     readonly AsyncIconCache _iconCache = new();
@@ -159,7 +163,7 @@ internal sealed class ReportForm : Form
         timelineHeader.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
         timelineHeader.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
         timelineHeader.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
-        timelineHeader.Controls.Add(BuildSectionHeader("24-hour timeline · Wheel to zoom, drag to move"), 0, 0);
+        timelineHeader.Controls.Add(BuildSectionHeader(UiText.T("24-hour timeline · Wheel: zoom · Drag: move · Shift+drag: select", "24시간 타임라인 · 휠 확대 · 드래그 이동 · Shift+드래그 구간 선택")), 0, 0);
         timelineHeader.Controls.Add(_timelineRange, 1, 0);
         timelineHeader.Controls.Add(resetTimeline, 2, 0);
         _dailyChart = new DailyUsageChartControl { Dock = DockStyle.Fill };
@@ -210,6 +214,11 @@ internal sealed class ReportForm : Form
         _timeline.VisibleRangeChanged += value => _timelineRange.Text = value;
         _timeline.SelectionDetailsChanged += value => _timelineDetails.Text = value;
         _timeline.ProcessSelected += SelectDashboardProcess;
+        _timeline.RangeSelected += (from, to, rows) =>
+        {
+            using var dialog = new TimelineRangeForm(from, to, rows);
+            dialog.ShowDialog(this);
+        };
         _dashboardGrid.CellClick += (_, e) =>
         {
             if (e.RowIndex < 0 || _dashboardGrid.Rows[e.RowIndex].Tag is not ReportEntry entry) return;
@@ -245,17 +254,26 @@ internal sealed class ReportForm : Form
         _comparisonTab = new TabPage("Compare");
         _dayComparisonGrid = BuildComparisonGrid();
         _weekComparisonGrid = BuildComparisonGrid();
+        _dayComparisonGrid.Columns["Current"].HeaderText = UiText.T("Today", "오늘");
+        _dayComparisonGrid.Columns["Previous"].HeaderText = UiText.T("Yesterday", "어제");
+        _weekComparisonGrid.Columns["Current"].HeaderText = UiText.T("This week", "이번 주");
+        _weekComparisonGrid.Columns["Previous"].HeaderText = UiText.T("Last week", "지난주");
         var comparisons = new TableLayoutPanel { Dock = DockStyle.Fill, RowCount = 2, ColumnCount = 1, Padding = new Padding(6) };
         comparisons.RowStyles.Add(new RowStyle(SizeType.Percent, 50));
         comparisons.RowStyles.Add(new RowStyle(SizeType.Percent, 50));
-        comparisons.Controls.Add(WrapComparison("Today vs yesterday · same elapsed time", _dayComparisonGrid), 0, 0);
-        comparisons.Controls.Add(WrapComparison("This week vs last week · same elapsed time", _weekComparisonGrid), 0, 1);
+        comparisons.Controls.Add(WrapComparison("Today vs yesterday · same elapsed time", _dayComparisonRange, _dayComparisonGrid), 0, 0);
+        comparisons.Controls.Add(WrapComparison("This week vs last week · same elapsed time", _weekComparisonRange, _weekComparisonGrid), 0, 1);
         _comparisonTab.Controls.Add(comparisons);
+
+        _periodTab = new TabPage(UiText.T("Period", "기간 통계"));
+        _periodStatistics = new PeriodStatisticsControl(_store, _clock, _iconCache);
+        _periodTab.Controls.Add(_periodStatistics);
 
         _tabs.TabPages.Add(_dashboardTab);
         _tabs.TabPages.Add(_overviewTab);
         _tabs.TabPages.Add(_allTimeTab);
         _tabs.TabPages.Add(_comparisonTab);
+        _tabs.TabPages.Add(_periodTab);
         Controls.Add(_tabs);
         _iconCache.IconResolved += OnIconResolved;
 
@@ -288,6 +306,12 @@ internal sealed class ReportForm : Form
         };
         _tabs.SelectedIndexChanged += (_, _) =>
         {
+            if (_tabs.SelectedTab == _periodTab)
+            {
+                CancelPendingRefresh();
+                _periodStatistics.EnsureLoaded();
+                return;
+            }
             if (Visible && !_isResizing) QueueVisibleRefresh();
         };
         ResizeBegin += (_, _) =>
@@ -316,6 +340,15 @@ internal sealed class ReportForm : Form
                 CancelPendingRefresh();
             }
         };
+        UiText.Apply(this);
+    }
+
+    public (DateOnly Day, int TabIndex) CaptureView() => (SelectedDashboardDate(), _tabs.SelectedIndex);
+
+    public void RestoreView(DateOnly day, int tabIndex)
+    {
+        SetDashboardDate(day);
+        _tabs.SelectedIndex = Math.Clamp(tabIndex, 0, _tabs.TabPages.Count - 1);
     }
 
     static DataGridView BuildGrid(ReportForm owner)
@@ -461,16 +494,21 @@ internal sealed class ReportForm : Form
         };
         foreach (var name in new[] { "Measure", "Current", "Previous", "Change" })
             grid.Columns.Add(new DataGridViewTextBoxColumn { Name = name, HeaderText = name, SortMode = DataGridViewColumnSortMode.NotSortable });
+        UsageTableStyle.Apply(grid, "Current", "Previous", "Change");
+        grid.Columns["Measure"].FillWeight = 130;
         return grid;
     }
 
-    static Control WrapComparison(string title, Control grid)
+    static Control WrapComparison(string title, Label range, Control grid)
     {
-        var panel = new TableLayoutPanel { Dock = DockStyle.Fill, RowCount = 2, ColumnCount = 1, Padding = new Padding(4) };
+        var panel = new TableLayoutPanel { Dock = DockStyle.Fill, RowCount = 3, ColumnCount = 1, Padding = new Padding(4) };
         panel.RowStyles.Add(new RowStyle(SizeType.Absolute, 26));
+        panel.RowStyles.Add(new RowStyle(SizeType.Absolute, 24));
         panel.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
         panel.Controls.Add(BuildSectionHeader(title), 0, 0);
-        panel.Controls.Add(grid, 0, 1);
+        range.ForeColor = SystemColors.GrayText;
+        panel.Controls.Add(range, 0, 1);
+        panel.Controls.Add(grid, 0, 2);
         return panel;
     }
 
@@ -560,6 +598,7 @@ internal sealed class ReportForm : Form
     {
         var now = _clock.UtcNow;
         RefreshTodayBoundary(now);
+        if (_tabs.SelectedTab == _periodTab) return;
         if (_tabs.SelectedTab == _dashboardTab && SelectedDashboardDate() != _lastKnownToday &&
             _dailyThroughDay < _lastKnownToday)
             return;
@@ -580,6 +619,11 @@ internal sealed class ReportForm : Form
         if (!Visible || _isResizing)
         {
             if (invalidateHistorical) CancelPendingRefresh();
+            return;
+        }
+        if (_tabs.SelectedTab == _periodTab)
+        {
+            _periodStatistics.EnsureLoaded();
             return;
         }
 
@@ -682,6 +726,7 @@ internal sealed class ReportForm : Form
         {
             var (day, week) = ComparisonPeriods.At(request.Now, TimeZoneInfo.Local);
             return new ComparisonReportData(
+                day, week,
                 UsageComparison.Create(aggregator.TopN(day.CurrentStart, day.CurrentEnd, request.Now),
                     aggregator.TopN(day.PreviousStart, day.PreviousEnd, request.Now)),
                 UsageComparison.Create(aggregator.TopN(week.CurrentStart, week.CurrentEnd, request.Now),
@@ -751,6 +796,8 @@ internal sealed class ReportForm : Form
                 Populate(_allGrid, allTime.Entries);
                 break;
             case ComparisonReportData comparison:
+                _dayComparisonRange.Text = DescribeComparisonRange(comparison.DayRange);
+                _weekComparisonRange.Text = DescribeComparisonRange(comparison.WeekRange);
                 PopulateComparison(_dayComparisonGrid, comparison.Day);
                 PopulateComparison(_weekComparisonGrid, comparison.Week);
                 break;
@@ -882,6 +929,13 @@ internal sealed class ReportForm : Form
     static DateOnly LocalToday(DateTimeOffset now) =>
         DateOnly.FromDateTime(TimeZoneInfo.ConvertTime(now, TimeZoneInfo.Local).DateTime);
 
+    static string DescribeComparisonRange(ComparisonRange range)
+    {
+        static string Local(DateTimeOffset value) => TimeZoneInfo.ConvertTime(value, TimeZoneInfo.Local).ToString("yyyy-MM-dd HH:mm:ss");
+        return $"{UiText.T("Current", "현재")}: {Local(range.CurrentStart)} ~ {Local(range.CurrentEnd)}    " +
+               $"{UiText.T("Previous", "이전")}: {Local(range.PreviousStart)} ~ {Local(range.PreviousEnd)}";
+    }
+
     static void PopulateComparison(DataGridView grid, IReadOnlyList<UsageComparisonRow> rows)
     {
         grid.SuspendLayout();
@@ -891,15 +945,25 @@ internal sealed class ReportForm : Form
             foreach (var row in rows)
             {
                 var difference = row.DifferenceSeconds == 0 ? "—" :
-                    $"{(row.DifferenceSeconds > 0 ? "+" : "−")}{FormatDuration(Math.Abs(row.DifferenceSeconds))}";
-                grid.Rows.Add(row.Name, FormatDuration(row.CurrentSeconds), FormatDuration(row.PreviousSeconds), difference);
+                    $"{(row.DifferenceSeconds > 0 ? "+" : "−")}{UsageTableStyle.Duration(Math.Abs(row.DifferenceSeconds))}";
+                var name = row.Name.StartsWith("Category: ", StringComparison.Ordinal)
+                    ? $"{UiText.T("Category", "분류")}: {UiText.Category(row.Name[10..])}" : UiText.Translate(row.Name);
+                var index = grid.Rows.Add(name, UsageTableStyle.Duration(row.CurrentSeconds), UsageTableStyle.Duration(row.PreviousSeconds), difference);
+                if (!row.Name.StartsWith("Category: ", StringComparison.Ordinal))
+                    grid.Rows[index].DefaultCellStyle.Font = UsageTableStyle.StrongFont;
+                if (!SystemInformation.HighContrast && row.DifferenceSeconds != 0)
+                    grid.Rows[index].Cells["Change"].Style.ForeColor = row.DifferenceSeconds > 0 ? UsageTableStyle.IncreaseColor : UsageTableStyle.DecreaseColor;
             }
             grid.ClearSelection();
         }
         finally { grid.ResumeLayout(); }
     }
 
-    public void RequestReload() => QueueVisibleRefresh(invalidateHistorical: true);
+    public void RequestReload()
+    {
+        _periodStatistics.InvalidateData();
+        QueueVisibleRefresh(invalidateHistorical: true);
+    }
 
     void Populate(DataGridView grid, IReadOnlyList<ReportEntry> entries)
     {
@@ -908,8 +972,19 @@ internal sealed class ReportForm : Form
         if (_gridOptions.TryGetValue(grid, out var options))
         {
             if (grid is BufferedDataGridView buffered)
-                buffered.EmptyMessage = string.IsNullOrWhiteSpace(options.Search.Text) ? "No activity recorded" : "No matching applications";
-            entries = ReportListOptions.Apply(entries, options.Search.Text, (ReportListSort)Math.Max(0, options.Sort.SelectedIndex));
+                buffered.EmptyMessage = UiText.Translate(string.IsNullOrWhiteSpace(options.Search.Text) ? "No activity recorded" : "No matching applications");
+            var term = options.Search.Text.Trim();
+            if (UiText.Korean && term.Length > 0)
+            {
+                entries = entries.Where(entry => entry.DisplayName.Contains(term, StringComparison.CurrentCultureIgnoreCase) ||
+                    entry.ProcessName.Contains(term, StringComparison.CurrentCultureIgnoreCase) ||
+                    (string.Equals(entry.ProcessName, IdleSentinel.Name, StringComparison.OrdinalIgnoreCase) &&
+                     "자리 비움".Contains(term, StringComparison.CurrentCultureIgnoreCase)) ||
+                    UiText.Category(entry.CategoryName ?? "Other").Contains(term, StringComparison.CurrentCultureIgnoreCase) ||
+                    (entry.CategoryName?.Contains(term, StringComparison.CurrentCultureIgnoreCase) ?? false)).ToArray();
+                term = string.Empty;
+            }
+            entries = ReportListOptions.Apply(entries, term, (ReportListSort)Math.Max(0, options.Sort.SelectedIndex));
         }
         var rebuildRows = !RowsMatchEntries(grid, entries);
         var selectedProcesses = rebuildRows
@@ -993,14 +1068,14 @@ internal sealed class ReportForm : Form
             });
         }
 
-        AddText("Tracked share:");
+        AddText(UiText.T("Tracked share:", "기록 비율:"));
         foreach (var category in categories.Where(item => !item.IsIdle))
-            AddText($"{category.DisplayName} {(total > 0 ? category.TotalSeconds * 100d / total : 0):0.#}%",
+            AddText($"{UiText.Category(category.DisplayName)} {(total > 0 ? category.TotalSeconds * 100d / total : 0):0.#}%",
                 ColorFromRgb(category.ColorRgb));
         var idle = categories.FirstOrDefault(item => item.IsIdle);
-        AddText($"▧ Idle {(total > 0 ? idle.TotalSeconds * 100d / total : 0):0.#}%");
-        AddText("□ No record");
-        AddText("App-specific colors may differ");
+        AddText($"▧ {UiText.T("Idle", "자리 비움")} {(total > 0 ? idle.TotalSeconds * 100d / total : 0):0.#}%");
+        AddText(UiText.T("□ No record", "□ 기록 없음"));
+        AddText(UiText.T("App-specific colors may differ", "앱별 색상은 다를 수 있음"));
     }
 
     void IndexRows(DataGridView grid)
@@ -1038,8 +1113,8 @@ internal sealed class ReportForm : Form
             : entry;
 
         SetCellValue(row.Cells["Icon"], iconLookup.Image ?? _iconCache.EmptyImage);
-        SetCellValue(row.Cells["Process"], isIdle ? IdleDisplayName : entry.DisplayName);
-        SetCellValue(row.Cells["Category"], isIdle ? string.Empty : entry.CategoryName ?? "Other");
+        SetCellValue(row.Cells["Process"], isIdle ? UiText.T(IdleDisplayName, "(자리 비움)") : entry.DisplayName);
+        SetCellValue(row.Cells["Category"], isIdle ? string.Empty : UiText.Category(entry.CategoryName ?? "Other"));
         SetCellValue(row.Cells["Duration"], FormatDuration(entry.TotalSeconds));
         var pct = total > 0 ? (double)entry.TotalSeconds / total * 100.0 : 0.0;
         SetCellValue(row.Cells["Share"], $"{pct:0.0}%");
@@ -1068,7 +1143,7 @@ internal sealed class ReportForm : Form
 
         var tooltip = isIdle
             ? string.Empty
-            : $"Process: {entry.ProcessName}\nCategory: {entry.CategoryName ?? "Other"}\n{rowEntry.ExePath ?? string.Empty}";
+            : $"{UiText.T("Process", "프로세스")}: {entry.ProcessName}\n{UiText.T("Category", "분류")}: {UiText.Category(entry.CategoryName ?? "Other")}\n{rowEntry.ExePath ?? string.Empty}";
         if (!string.Equals(row.Cells["Process"].ToolTipText, tooltip, StringComparison.Ordinal))
             row.Cells["Process"].ToolTipText = tooltip;
     }
@@ -1177,7 +1252,7 @@ internal sealed class ReportForm : Form
             var directory = Path.GetDirectoryName(exePath);
             if (string.IsNullOrEmpty(directory) || !Directory.Exists(directory))
             {
-                MessageBox.Show(this, "The program folder could not be found.", "Folder unavailable",
+                MessageBox.Show(this, UiText.T("The program folder could not be found.", "프로그램 폴더를 찾을 수 없습니다."), UiText.T("Folder unavailable", "폴더 없음"),
                     MessageBoxButtons.OK, MessageBoxIcon.Information);
                 return;
             }
@@ -1191,7 +1266,7 @@ internal sealed class ReportForm : Form
         catch (Exception ex)
         {
             Log.Warning(ex, "Open containing folder failed for {Path}", exePath);
-            MessageBox.Show(this, $"Could not open the program folder: {ex.Message}", "Error",
+            MessageBox.Show(this, UiText.T($"Could not open the program folder: {ex.Message}", $"프로그램 폴더를 열지 못했습니다: {ex.Message}"), UiText.T("Error", "오류"),
                 MessageBoxButtons.OK, MessageBoxIcon.Error);
         }
     }
@@ -1210,9 +1285,9 @@ internal sealed class ReportForm : Form
         if (string.Equals(processName, IdleSentinel.Name, StringComparison.OrdinalIgnoreCase))
             return;
 
-        var msg = $"Delete all history for '{processName}' and stop tracking it from now on?\n\n" +
-                  $"This cannot be undone.";
-        var result = MessageBox.Show(this, msg, "Confirm delete & exclude",
+        var msg = UiText.T($"Delete all history for '{processName}' and stop tracking it from now on?\n\nThis cannot be undone.",
+            $"'{processName}'의 사용 기록을 모두 삭제하고 앞으로 추적하지 않으시겠습니까?\n\n이 작업은 되돌릴 수 없습니다.");
+        var result = MessageBox.Show(this, msg, UiText.T("Confirm delete & exclude", "삭제 및 추적 제외 확인"),
             MessageBoxButtons.YesNo, MessageBoxIcon.Question, MessageBoxDefaultButton.Button2);
         if (result != DialogResult.Yes) return;
 
@@ -1227,7 +1302,7 @@ internal sealed class ReportForm : Form
         catch (Exception ex)
         {
             Log.Error(ex, "Delete & exclude failed for {Name}", processName);
-            MessageBox.Show(this, $"Operation failed: {ex.Message}", "Error",
+            MessageBox.Show(this, UiText.T($"Operation failed: {ex.Message}", $"작업에 실패했습니다: {ex.Message}"), UiText.T("Error", "오류"),
                 MessageBoxButtons.OK, MessageBoxIcon.Error);
         }
     }
@@ -1308,7 +1383,7 @@ internal sealed class ReportForm : Form
         IReadOnlyList<ReportEntry> Month) : ReportData;
 
     sealed record AllTimeReportData(IReadOnlyList<ReportEntry> Entries) : ReportData;
-    sealed record ComparisonReportData(IReadOnlyList<UsageComparisonRow> Day, IReadOnlyList<UsageComparisonRow> Week) : ReportData;
+    sealed record ComparisonReportData(ComparisonRange DayRange, ComparisonRange WeekRange, IReadOnlyList<UsageComparisonRow> Day, IReadOnlyList<UsageComparisonRow> Week) : ReportData;
 }
 
 internal sealed class BufferedDataGridView : DataGridView
@@ -1330,7 +1405,7 @@ internal sealed class BufferedDataGridView : DataGridView
         emptyArea.Height -= ColumnHeadersVisible ? ColumnHeadersHeight : 0;
         TextRenderer.DrawText(
             e.Graphics,
-            EmptyMessage,
+            UiText.Translate(EmptyMessage),
             Font,
             emptyArea,
             SystemColors.GrayText,
